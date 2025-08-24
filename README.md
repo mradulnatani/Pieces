@@ -1,9 +1,9 @@
-Pieces: Your Own Containerization Tool 🧩
+# Pieces: Your Own Containerization Tool 🧩
 
 Pieces is a simple, educational containerization tool built from scratch in Python. It's designed to demonstrate the core Linux technologies that power modern container runtimes like Docker. With Pieces, you can build container images from a definition file and run isolated, sandboxed environments.
 
 This project was built to explore and learn about the fundamental "pieces" of containerization.
-✨ Features
+## ✨ Features
 
     Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.
 
@@ -15,7 +15,7 @@ This project was built to explore and learn about the fundamental "pieces" of co
 
     Filesystem Isolation: Uses the powerful pivot_root system call to give the container a completely separate root filesystem, providing true filesystem isolation.
 
-⚙️ How it Works
+## ⚙️ How it Works
 
 Pieces leverages fundamental Linux kernel features to create containers:
 
@@ -27,7 +27,7 @@ Pieces leverages fundamental Linux kernel features to create containers:
 
     Piecefile: A simple, declarative file tells Pieces where to get the base filesystem (FROM_URL) and what default command to run (CMD).
 
-📋 Prerequisites
+## 📋 Prerequisites
 
     A Linux operating system (tested on Ubuntu).
 
@@ -35,7 +35,7 @@ Pieces leverages fundamental Linux kernel features to create containers:
 
     Root privileges (sudo) are required to create namespaces and manipulate filesystems.
 
-🚀 Setup and Installation
+## 🚀 Setup and Installation
 
     Clone the repository:
 
@@ -51,7 +51,7 @@ Pieces leverages fundamental Linux kernel features to create containers:
 
     The script is ready to use! There are no external Python packages to install.
 
-🛠️ Usage
+## 🛠️ Usage
 
 Using Pieces is a two-step process: build and run.
 1. Build an Image
@@ -89,7 +89,7 @@ Once the image is built, you can run a container from it.
     sudo python3 pieces.py run alpine-minirootfs-3.18.3-x86_64 ps aux
 
 
-📦 Building a Standalone Binary
+## 📦 Building a Standalone Binary
 
 You can package "Pieces" into a single executable file using PyInstaller. This allows you to run it on any compatible Linux system without needing a Python interpreter.
 
@@ -115,7 +115,7 @@ You can package "Pieces" into a single executable file using PyInstaller. This a
     sudo ./dist/pieces run alpine-minirootfs-3.18.3-x86_64
 
 
-🔮 Future Work
+## 🔮 Future Work
 
     Networking: Implement network namespaces to give containers their own private network stack.
 
