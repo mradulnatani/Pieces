@@ -3,3 +3,4 @@ FROM_URL https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-mini
 
 # The default command to run when the container starts
 CMD /bin/sh
+
