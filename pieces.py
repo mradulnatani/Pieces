@@ -22,17 +22,15 @@ MS_REC = 16384
 MNT_DETACH = 2
 MS_PRIVATE = 1 << 18 # This is the flag for a private mount
 
+
 def pivot_root(new_root, put_old):
-    """
-    A wrapper for the pivot_root syscall.
-    """
+    """A wrapper for the pivot_root syscall."""
     arch = platform.machine()
     if arch == "x86_64":
         syscall_num = 155
     else:
         print(f"Error: pivot_root syscall number not known for architecture {arch}.")
         sys.exit(1)
-
     if libc.syscall(syscall_num, new_root.encode(), put_old.encode()) != 0:
         errno = ctypes.get_errno()
         raise OSError(errno, f"pivot_root failed: {os.strerror(errno)}")
@@ -65,17 +63,19 @@ def handle_run(args):
         print(f"Error: Image '{image_name}' not found. Did you build it first?")
         sys.exit(1)
     print(f"RUN: Starting container from image '{image_name}'...")
+    
+    # Attempt to unmount the image path before forking to clean up stale mounts
+    try:
+        libc.umount2(image_path.encode(), MNT_DETACH)
+    except Exception:
+        pass
+
     pid = os.fork()
     if pid == 0:
-        # --- CHILD PROCESS ---
+        # --- FIRST CHILD (SETUP PROCESS) ---
         try:
             libc.unshare(CLONE_NEWPID | CLONE_NEWNS)
-            
-            # *** THE DEFINITIVE FIX IS HERE ***
-            # Make all mount points in this new namespace private. This prevents
-            # our mounts from affecting the host and is required for pivot_root.
             libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
-            
             libc.mount(image_path.encode(), image_path.encode(), b"bind", MS_BIND | MS_REC, None)
             
             old_root_dir = os.path.join(image_path, "old_root")
@@ -87,7 +87,6 @@ def handle_run(args):
             libc.umount2(b"/old_root", MNT_DETACH)
             os.rmdir("/old_root")
             
-            # Mount essential virtual filesystems
             os.makedirs("/proc", exist_ok=True)
             libc.mount(b"proc", b"/proc", b"proc", 0, None)
             os.makedirs("/sys", exist_ok=True)
@@ -97,33 +96,35 @@ def handle_run(args):
             os.makedirs("/dev/pts", exist_ok=True)
             libc.mount(b"devpts", b"/dev/pts", b"devpts", 0, None)
             
-            # Safely create device nodes and symlinks
-            if not os.path.exists("/dev/null"):
-                os.mknod("/dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
-            if not os.path.exists("/dev/zero"):
-                os.mknod("/dev/zero", stat.S_IFCHR | 0o666, os.makedev(1, 5))
-            if not os.path.exists("/dev/tty"):
-                os.mknod("/dev/tty", stat.S_IFCHR | 0o666, os.makedev(5, 0))
-            if not os.path.lexists("/dev/stdin"):
-                os.symlink("/proc/self/fd/0", "/dev/stdin")
-            if not os.path.lexists("/dev/stdout"):
-                os.symlink("/proc/self/fd/1", "/dev/stdout")
-            if not os.path.lexists("/dev/stderr"):
-                os.symlink("/proc/self/fd/2", "/dev/stderr")
+            # Create essential device nodes and symlinks
+            if not os.path.exists("/dev/null"): os.mknod("/dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+            if not os.path.exists("/dev/zero"): os.mknod("/dev/zero", stat.S_IFCHR | 0o666, os.makedev(1, 5))
+            if not os.path.exists("/dev/tty"): os.mknod("/dev/tty", stat.S_IFCHR | 0o666, os.makedev(5, 0))
+            if not os.path.lexists("/dev/stdin"): os.symlink("/proc/self/fd/0", "/dev/stdin")
+            if not os.path.lexists("/dev/stdout"): os.symlink("/proc/self/fd/1", "/dev/stdout")
+            if not os.path.lexists("/dev/stderr"): os.symlink("/proc/self/fd/2", "/dev/stderr")
 
-            command_and_args = args.cmd_args
-            if not command_and_args:
-                instructions = parse_piecefile("Piecefile")
-                if instructions and 'CMD' in instructions:
-                    command_and_args = instructions['CMD'].split()
-                else:
-                    command_and_args = ["/bin/sh"]
-            os.execvp(command_and_args[0], command_and_args)
+            # *** THE FINAL FIX: DOUBLE FORK ***
+            # Create a pristine grandchild process to run the user's command
+            pid2 = os.fork()
+            if pid2 == 0:
+                # --- GRANDCHILD (USER COMMAND PROCESS) ---
+                command_and_args = args.cmd_args
+                if not command_and_args:
+                    instructions = parse_piecefile("Piecefile")
+                    if instructions and 'CMD' in instructions:
+                        command_and_args = instructions['CMD'].split()
+                    else:
+                        command_and_args = ["/bin/sh"]
+                os.execvp(command_and_args[0], command_and_args)
+            else:
+                # The first child's job is done, it waits for the grandchild and exits
+                os.waitpid(pid2, 0)
+                sys.exit(0)
 
         except Exception as e:
             print(f"CHILD ERROR: {e}", file=sys.stderr)
             sys.exit(1)
-
     else:
         # --- PARENT PROCESS ---
         os.waitpid(pid, 0)
@@ -142,6 +143,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 #if len(sys.argv) < 2:
