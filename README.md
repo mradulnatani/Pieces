@@ -1,4 +1,4 @@
-Pieces 🧩: Python based containerization tool
+# Pieces 🧩: Python based containerization tool
 
 Pieces is a simple, containerization tool built entirely in Python. It's designed to demystify the "magic" behind tools like Docker by building a container runtime from its fundamental components—the "pieces" of containerization. This project serves as a hands-on guide to the core Linux technologies that make modern containers possible.
 ✨ Features
