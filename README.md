@@ -2,17 +2,17 @@ Pieces 🧩: Building a Container Runtime from Scratch
 
 Pieces is a simple, educational containerization tool built entirely in Python. It's designed to demystify the "magic" behind tools like Docker by building a container runtime from its fundamental components—the "pieces" of containerization. This project serves as a hands-on guide to the core Linux technologies that make modern containers possible.
 ✨ Features
+<ol>
+<b>Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.</b>
 
-    Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.
+<b>Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.</b>
 
-    Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.
+<b>Run Containers: Run commands inside a fully isolated environment using the images you've built.</b>
 
-    Run Containers: Run commands inside a fully isolated environment using the images you've built.
+<b>True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.</b>
 
-    True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.
-
-    Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.
-
+<b>Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.</b>
+</ol>
 🗺️ The Journey: Problems We Faced & Concepts Learned
 
 Building a container runtime is a journey through the depths of the Linux kernel. Here are the major challenges we faced and the concepts we learned to overcome them.
@@ -112,31 +112,14 @@ Prerequisites
 
 Installation Steps
 
-    Clone the Repository and cd into it.
-
-    Create a Python Virtual Environment (Recommended).
-
+    git clone https://github.com/mradulnatani/Pieces.git
+    cd Pieces
     python3 -m venv venv
     source venv/bin/activate
-
-    Install PyInstaller:
-    This tool packages our Python script and all its modules into a single executable.
-
+    pip install -r requirements.txt
     pip install pyinstaller
-
-    Build the Standalone Binary:
-    Run this command from the project's root directory. It tells PyInstaller to create a single file and correctly bundle our src directory.
-
     pyinstaller --onefile --add-data 'src:src' pieces.py
-
-    "Install" the Binary:
-    This step moves the new executable from the dist/ folder to /usr/local/bin, a standard location for custom system commands. This makes it available everywhere.
-
     sudo mv dist/pieces /usr/local/bin/pieces
-
-    You're Done!
-    You can now use Pieces from any directory on your system.
-
     # Test it out!
     sudo pieces --help
 
