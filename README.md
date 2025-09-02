@@ -1,121 +1,146 @@
-# Pieces: Your Own Containerization Tool 🧩
+Pieces 🧩: Building a Container Runtime from Scratch
 
-Pieces is a simple, educational containerization tool built from scratch in Python. It's designed to demonstrate the core Linux technologies that power modern container runtimes like Docker. With Pieces, you can build container images from a definition file and run isolated, sandboxed environments.
-
-This project was built to explore and learn about the fundamental "pieces" of containerization.
-## ✨ Features
+Pieces is a simple, educational containerization tool built entirely in Python. It's designed to demystify the "magic" behind tools like Docker by building a container runtime from its fundamental components—the "pieces" of containerization. This project serves as a hands-on guide to the core Linux technologies that make modern containers possible.
+✨ Features
 
     Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.
 
-    Download from URL: Automatically downloads a root filesystem (e.g., Alpine Linux) from a URL specified in the Piecefile.
+    Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.
 
     Run Containers: Run commands inside a fully isolated environment using the images you've built.
 
-    Process Isolation: Uses PID namespaces to ensure processes inside the container cannot see or affect processes on the host machine.
+    True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.
 
-    Filesystem Isolation: Uses the powerful pivot_root system call to give the container a completely separate root filesystem, providing true filesystem isolation.
+    Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.
 
-## ⚙️ How it Works
+🗺️ The Journey: Problems We Faced & Concepts Learned
 
-Pieces leverages fundamental Linux kernel features to create containers:
+Building a container runtime is a journey through the depths of the Linux kernel. Here are the major challenges we faced and the concepts we learned to overcome them.
+Part 1: The Foundation - "How do I run a command?"
 
-    Namespaces: It uses CLONE_NEWPID and CLONE_NEWNS flags to create new Process ID and Mount namespaces. This is the core of the isolation.
+The first step was to simply run a command like ls as a child process.
 
-    pivot_root: Instead of the limited chroot, Pieces uses pivot_root to swap the entire filesystem view, creating a stable and robust container environment.
+    Concept Learned: fork() and exec()
+    We learned that this is a two-step dance in Linux. First, os.fork() creates an identical copy of our script (the child). Then, os.execvp() transforms that child into a new program (like ls or /bin/sh). This fork-exec model is the foundation of all process creation in Linux.
 
-    Virtual Filesystems: It correctly mounts essential virtual filesystems like /proc, /sys, and /dev inside the container, allowing most standard Linux commands to work as expected.
+Part 2: Isolation - "How do I hide the host?"
 
-    Piecefile: A simple, declarative file tells Pieces where to get the base filesystem (FROM_URL) and what default command to run (CMD).
+Our first container could still see every process on the host machine. The next challenge was to isolate it.
 
-## 📋 Prerequisites
+    Concept Learned: Linux Namespaces (CLONE_NEWPID)
+    We used ctypes to call the unshare system call with the CLONE_NEWPID flag. This placed our child process in its own "private room" where it became PID 1 and could no longer see the host's process tree.
+
+    Problem Faced: The "Leaky" /proc Filesystem
+    Even with a new PID namespace, running ps aux inside the container still showed all the host's processes!
+
+    Concept Learned: Virtual Filesystems
+    We discovered that ps gets its information by reading the /proc filesystem. We were mounting the host's /proc directly into the container, giving it a "security monitor" to see the outside world. The final fix was to mount a new, correctly-scoped /proc after entering the new PID namespace, ensuring the container could only see itself.
+
+Part 3: The Final, Vicious Bug - "Why does my second command fail?"
+
+This was the most difficult and frustrating challenge. After upgrading our filesystem logic to use pivot_root, our container would start perfectly. The first command (ls) would work, but any subsequent command would fail with a misleading error: /bin/sh: can't fork: Out of memory.
+
+    Problem Faced: Unstable Environment
+    We were not out of memory. This generic error meant the shell was in an unstable state and the kernel was refusing its request to fork a new process.
+
+    Concept Learned: Mount Propagation (MS_PRIVATE)
+    The root cause was a deep kernel feature. By default, a new mount namespace can still "share" filesystem events with the host. This "leaky" connection was destabilizing our pivot_root environment. The definitive fix was to add one more mount command after creating the namespace to make the container's entire filesystem view recursively private, severing the final link to the host.
+
+    Concept Learned: The "Double Fork"
+    We further stabilized the environment by separating the "setup" process from the final "user" process. The first child creates the isolated environment, then forks a "pristine" grandchild to actually run the user's command. This ensures the final process is completely clean, solving the instability for good.
+
+🛠️ Usage Tutorial
+
+Using Pieces is a two-step process: build an image from a recipe, then run a container from that image.
+1. The Piecefile
+
+This is a simple text file that acts as the recipe for your container. It must be named Piecefile and placed in your build directory.
+
+Keywords:
+
+    FROM <image>:<tag> (Recommended): Tells Pieces to build from a known, reliable distribution. The following images are currently supported:
+
+        alpine:3.18
+
+        ubuntu:22.04
+
+        fedora:38
+
+    FROM_URL <url> (Advanced): Tells Pieces to download a root filesystem from any direct URL to a compatible .tar.gz file.
+
+    CMD <command>: Sets the default command to run when the container starts.
+
+Example Piecefile for Ubuntu:
+
+# The new, user-friendly Piecefile for Ubuntu 22.04
+FROM ubuntu:22.04
+
+# The default command to run is the bash shell
+CMD /bin/bash
+
+2. The build Command
+
+This command reads your Piecefile, downloads the necessary files, and creates a reusable image in a hidden .pieces/ directory.
+
+# Assuming 'pieces' has been installed as a binary
+sudo pieces build .
+
+3. The run Command
+
+This command starts a container from a pre-built image.
+
+    To run the default command (from CMD):
+
+    # Use the image name from the Piecefile's FROM tag
+    sudo pieces run ubuntu-22.04
+
+    To run a specific command inside the container:
+
+    # This will run 'ps aux' inside the container and exit
+    sudo pieces run ubuntu-22.04 ps aux
+
+📦 Installation: From Script to System Command
+
+To use "Pieces" like a real command-line tool (e.g., sudo pieces build .), you need to build a standalone binary and move it to a directory on your system's PATH.
+Prerequisites
 
     A Linux operating system (tested on Ubuntu).
 
     Python 3.6+.
 
-    Root privileges (sudo) are required to create namespaces and manipulate filesystems.
+    Root privileges (sudo) are required for all operations.
 
-## 🚀 Setup and Installation
+Installation Steps
 
-    Clone the repository:
+    Clone the Repository and cd into it.
 
-    git clone https://github.com/mradulnatani/Pieces.git
-    cd Pieces
-
-
-    Create a Python virtual environment (recommended):
+    Create a Python Virtual Environment (Recommended).
 
     python3 -m venv venv
     source venv/bin/activate
 
-
-    The script is ready to use! There are no external Python packages to install.
-
-## 🛠️ Usage
-
-Using Pieces is a two-step process: build and run.
-1. Build an Image
-
-First, you need to create an image from a Piecefile.
-
-    Create a Piecefile in your project's root directory:
-
-    # The recipe for our Alpine Linux container
-    FROM_URL https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-minirootfs-3.18.3-x86_64.tar.gz
-
-    # The default command to run when the container starts
-    CMD /bin/sh
-
-
-    Run the build command: The . tells Pieces to look for the Piecefile in the current directory.
-
-    sudo python3 pieces.py build .
-
-
-    This will download the Alpine rootfs and unpack it into the .pieces/images/ directory.
-
-2. Run a Container
-
-Once the image is built, you can run a container from it.
-
-    To run the default command (/bin/sh from the Piecefile):
-
-    sudo python3 pieces.py run alpine-minirootfs-3.18.3-x86_64
-
-
-    To run a specific command inside the container:
-
-    # This will run the 'ps aux' command inside the container
-    sudo python3 pieces.py run alpine-minirootfs-3.18.3-x86_64 ps aux
-
-
-## 📦 Building a Standalone Binary
-
-You can package "Pieces" into a single executable file using PyInstaller. This allows you to run it on any compatible Linux system without needing a Python interpreter.
-
     Install PyInstaller:
+    This tool packages our Python script and all its modules into a single executable.
 
     pip install pyinstaller
 
-
-    Build the binary: Run this command from your project's root directory. It tells PyInstaller to bundle your main script and all the files in the src directory.
+    Build the Standalone Binary:
+    Run this command from the project's root directory. It tells PyInstaller to create a single file and correctly bundle our src directory.
 
     pyinstaller --onefile --add-data 'src:src' pieces.py
 
+    "Install" the Binary:
+    This step moves the new executable from the dist/ folder to /usr/local/bin, a standard location for custom system commands. This makes it available everywhere.
 
-    Find the executable: Your standalone binary will be located in the dist/ directory.
+    sudo mv dist/pieces /usr/local/bin/pieces
 
-    ls dist/
-    # Output: pieces
+    You're Done!
+    You can now use Pieces from any directory on your system.
 
+    # Test it out!
+    sudo pieces --help
 
-    Run the binary: You can now use this single file just like your script.
-
-    sudo ./dist/pieces build .
-    sudo ./dist/pieces run alpine-minirootfs-3.18.3-x86_64
-
-
-## 🔮 Future Work
+🔮 Future Work
 
     Networking: Implement network namespaces to give containers their own private network stack.
 
