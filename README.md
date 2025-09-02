@@ -3,15 +3,15 @@
 Pieces is a simple, containerization tool built entirely in Python. It's designed to demystify the "magic" behind tools like Docker by building a container runtime from its fundamental components—the "pieces" of containerization. This project serves as a hands-on guide to the core Linux technologies that make modern containers possible.
 ✨ Features
 <ol>
-<b>Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.</b>
+<b>- Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.</b>
 
-<b>Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.</b>
+<b>- Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.</b>
 
-<b>Run Containers: Run commands inside a fully isolated environment using the images you've built.</b>
+<b>- Run Containers: Run commands inside a fully isolated environment using the images you've built.</b>
 
-<b>True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.</b>
+<b>- True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.</b>
 
-<b>Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.</b>
+<b>- Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.</b>
 </ol>
 🗺️ The Journey: Problems We Faced & Concepts Learned
 
