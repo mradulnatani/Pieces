@@ -6,6 +6,7 @@ import shutil
 import stat
 import platform
 import json
+from src.network import setup_host_network
 #from src.filesystem import build_image_from_url
 from src.cli import parse_command_args
 from src.parser import parse_piecefile
@@ -15,6 +16,7 @@ from src.filesystem import build_image
 libc = ctypes.CDLL("libc.so.6") #load the c librady
 #CONTAINER_ROOT = "/tmp/pieces-root"
 CLONE_NEWPID = 0x20000000 #flag for namespace creation
+CLONE_NEWNET = 0x40000000 #flag for new network interface
 CLONE_NEWNS = 0x00020000 #flag for isolation and creating a new file system
 PIECES_DIR = ".pieces"
 IMAGE_DIR = os.path.join(PIECES_DIR, "images")
@@ -83,13 +85,14 @@ def handle_run(args):
         libc.umount2(image_path.encode(), MNT_DETACH)
     except Exception:
         pass
-
+    setup_host_network()
     pid = os.fork()
     if pid == 0:
         # FIRST CHILD 
         try:
             # 1. Create new namespaces and make the mount points private.
-            libc.unshare(CLONE_NEWPID | CLONE_NEWNS)
+           # libc.unshare(CLONE_NEWPID | CLONE_NEWNS)
+            libc.unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)
             libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
             
             # 2. Fork a grandchild that will live in this clean environment.
