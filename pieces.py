@@ -6,6 +6,7 @@ import shutil
 import stat
 import platform
 import json
+from src.network import setup_host_network
 #from src.filesystem import build_image_from_url
 from src.cli import parse_command_args
 from src.parser import parse_piecefile
@@ -15,6 +16,7 @@ from src.filesystem import build_image
 libc = ctypes.CDLL("libc.so.6") #load the c librady
 #CONTAINER_ROOT = "/tmp/pieces-root"
 CLONE_NEWPID = 0x20000000 #flag for namespace creation
+CLONE_NEWNET = 0x40000000 #flag for new network interface
 CLONE_NEWNS = 0x00020000 #flag for isolation and creating a new file system
 PIECES_DIR = ".pieces"
 IMAGE_DIR = os.path.join(PIECES_DIR, "images")
@@ -36,7 +38,7 @@ def pivot_root(new_root, put_old):
         raise OSError(errno, f"pivot_root failed: {os.strerror(errno)}")
 
 def handle_build(args):
-    """Handles the 'build' command."""
+    #Handles the 'build' command
     print(f"BUILD: Building from context directory: {args.context}")
     os.makedirs(IMAGE_DIR, exist_ok=True)
     
@@ -69,7 +71,7 @@ def handle_build(args):
         sys.exit(1)
 
 def handle_run(args):
-    """Handles the 'run' command by starting a container from a pre-built image."""
+    #Handles the 'run' command 
     image_name = args.image
     image_path = os.path.join(IMAGE_DIR, image_name)
 
@@ -83,19 +85,20 @@ def handle_run(args):
         libc.umount2(image_path.encode(), MNT_DETACH)
     except Exception:
         pass
-
+    setup_host_network()
     pid = os.fork()
     if pid == 0:
-        # --- FIRST CHILD (NAMESPACE CREATION PROCESS) ---
+        # FIRST CHILD 
         try:
             # 1. Create new namespaces and make the mount points private.
-            libc.unshare(CLONE_NEWPID | CLONE_NEWNS)
+           # libc.unshare(CLONE_NEWPID | CLONE_NEWNS)
+            libc.unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)
             libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
             
             # 2. Fork a grandchild that will live in this clean environment.
             pid2 = os.fork()
             if pid2 == 0:
-                # --- GRANDCHILD (SETUP & USER COMMAND PROCESS) ---
+                # GRANDCHILD 
                 
                 # 3. Pivot into the new root filesystem.
                 libc.mount(image_path.encode(), image_path.encode(), b"bind", MS_BIND | MS_REC, None)
