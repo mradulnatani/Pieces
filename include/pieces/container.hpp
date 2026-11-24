@@ -28,13 +28,26 @@ struct ContainerRunConfig {
     bool allocate_tty{false};
     bool rootless{false};
     bool privileged{false};
+    bool readonly_rootfs{false};
+    bool full_copy{false};
+    bool run_as_non_root{false};
+    bool isolate_net{true};
+    bool timing{false};
     RestartPolicy restart_policy{RestartPolicy::No};
     std::size_t log_max_bytes{10ULL * 1024ULL * 1024ULL};
     int log_max_files{3};
     std::string network_mode{"bridge"};
+    std::optional<std::string> user_spec;
+    std::optional<std::string> seccomp_profile;
+    std::optional<std::string> entrypoint_override;
+    std::vector<std::string> security_opts;
     std::vector<std::string> env_specs;
+    std::vector<std::string> env_files;
     std::vector<std::string> volume_specs;
+    std::vector<std::string> tmpfs_specs;
     std::vector<std::string> port_specs;
+    std::vector<std::string> add_hosts;
+    std::vector<std::string> dns_servers;
     std::vector<std::string> cap_add;
     std::vector<std::string> cap_drop;
     std::optional<std::string> memory_limit;
@@ -44,6 +57,8 @@ struct ContainerRunConfig {
     std::optional<std::string> workdir;
     std::string image_dir{IMAGE_DIR};
     std::string containers_dir{CONTAINERS_DIR};
+    std::string volumes_dir{VOLUMES_DIR};
+    std::string networks_dir{NETWORKS_DIR};
 };
 
 class RotatingLogWriter {
@@ -65,6 +80,7 @@ private:
 [[nodiscard]] RestartPolicy parse_restart_policy(const std::string& spec);
 [[nodiscard]] std::string restart_policy_to_string(RestartPolicy policy);
 [[nodiscard]] std::size_t parse_byte_size(const std::string& spec);
+[[nodiscard]] std::vector<std::string> load_env_file(const std::string& path);
 
 [[nodiscard]] JsonObject load_image_metadata(const std::string& image_path);
 [[nodiscard]] std::vector<std::string> resolve_command(
@@ -78,6 +94,19 @@ private:
 [[nodiscard]] std::vector<JsonObject> list_containers(
     bool show_all = false,
     const std::string& containers_dir = CONTAINERS_DIR);
+[[nodiscard]] JsonObject inspect_container_json(
+    const std::string& identifier,
+    const std::string& containers_dir = CONTAINERS_DIR);
+[[nodiscard]] JsonObject inspect_any_json(
+    const std::string& identifier,
+    const std::string& image_dir = IMAGE_DIR,
+    const std::string& containers_dir = CONTAINERS_DIR);
+void copy_between_host_and_container(
+    const std::string& src_spec,
+    const std::string& dst_spec,
+    const std::string& image_dir = IMAGE_DIR,
+    const std::string& containers_dir = CONTAINERS_DIR);
+
 std::string remove_container(
     const std::string& identifier,
     bool force = false,
@@ -98,6 +127,10 @@ int exec_in_container(
     const std::optional<std::string>& workdir = std::nullopt,
     bool allocate_tty = false,
     const std::string& containers_dir = CONTAINERS_DIR);
+int show_container_stats(
+    const std::string& identifier,
+    const std::string& containers_dir = CONTAINERS_DIR,
+    const std::string& cgroup_root = "/sys/fs/cgroup");
 int run_container(const ContainerRunConfig& config);
 
 }  // namespace pieces

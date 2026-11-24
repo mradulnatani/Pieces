@@ -22,6 +22,9 @@ add_library(pieces_core STATIC
     src/cgroup.cpp
     src/network.cpp
     src/container.cpp
+    src/oci_runtime.cpp
+    src/compose.cpp
+    src/daemon.cpp
 )
 
 target_include_directories(pieces_core
@@ -36,6 +39,7 @@ target_link_libraries(pieces_core
         OpenSSL::Crypto
         PkgConfig::LIBCAP
         util
+        pthread
 )
 
 target_compile_options(pieces_core
