@@ -29,6 +29,10 @@ using HttpGetFn = std::function<HttpResponse(
     const std::vector<std::string>& headers,
     const std::string& save_to_path)>;
 
+[[nodiscard]] std::string sha256_string(const std::string& data);
+[[nodiscard]] std::string sha256_file(const std::string& path);
+
+[[nodiscard]] bool is_docker_hub_registry(const std::string& registry);
 [[nodiscard]] ImageReference parse_image_reference(const std::string& ref);
 [[nodiscard]] std::map<std::string, std::string> parse_www_authenticate(const std::string& header_value);
 [[nodiscard]] std::string host_oci_architecture();

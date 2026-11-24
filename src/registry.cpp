@@ -1,15 +1,19 @@
 #include "pieces/registry.hpp"
 
 #include <curl/curl.h>
+#include <openssl/evp.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -49,6 +53,26 @@ std::string url_encode(const std::string& val) {
         }
     }
     return out;
+}
+
+std::string digest_to_hex(const unsigned char* md, unsigned int len) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < len; ++i) {
+        oss << std::setw(2) << static_cast<unsigned int>(md[i]);
+    }
+    return oss.str();
+}
+
+void verify_sha256_digest_str(const std::string& expected_digest, const std::string& actual_hex, const std::string& label) {
+    if (expected_digest.rfind("sha256:", 0) != 0) {
+        throw std::runtime_error(label + " uses unsupported digest algorithm '" + expected_digest + "' (expected sha256:)");
+    }
+    std::string expected_hex = to_lower(expected_digest.substr(7));
+    if (expected_hex != actual_hex) {
+        throw std::runtime_error(
+            "SHA-256 mismatch for " + label + ": expected " + expected_hex + ", got " + actual_hex);
+    }
 }
 
 size_t write_string_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -107,6 +131,8 @@ HttpResponse default_http_get(
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp.headers);
@@ -195,11 +221,67 @@ HttpResponse registry_get_with_auth(
 
 }  // namespace
 
+std::string sha256_string(const std::string& data) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("Failed to allocate EVP_MD_CTX");
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int md_len = 0;
+    bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+              EVP_DigestUpdate(ctx, data.data(), data.size()) == 1 &&
+              EVP_DigestFinal_ex(ctx, md.data(), &md_len) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) {
+        throw std::runtime_error("SHA-256 digest computation failed");
+    }
+    return digest_to_hex(md.data(), md_len);
+}
+
+std::string sha256_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Cannot open file for SHA-256 check: " + path);
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("Failed to allocate EVP_MD_CTX");
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
+    std::array<char, 65536> buf{};
+    while (in.good()) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        std::streamsize count = in.gcount();
+        if (count > 0) {
+            if (EVP_DigestUpdate(ctx, buf.data(), static_cast<size_t>(count)) != 1) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error("EVP_DigestUpdate failed");
+            }
+        }
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int md_len = 0;
+    bool ok = EVP_DigestFinal_ex(ctx, md.data(), &md_len) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) {
+        throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+    return digest_to_hex(md.data(), md_len);
+}
+
+bool is_docker_hub_registry(const std::string& registry) {
+    std::string lower = to_lower(registry);
+    return lower == "docker.io" ||
+           lower == "registry-1.docker.io" ||
+           lower == "index.docker.io" ||
+           lower == "registry.hub.docker.com";
+}
+
 std::string ImageReference::default_local_name() const {
     std::string base = repository;
-    if (registry == "registry-1.docker.io" && base.rfind("library/", 0) == 0) {
-        base = base.substr(8);
-    }
     std::replace(base.begin(), base.end(), '/', '-');
     std::string raw = base + "-" + tag;
     std::replace(raw.begin(), raw.end(), ':', '-');
@@ -211,20 +293,32 @@ ImageReference parse_image_reference(const std::string& ref) {
         throw std::invalid_argument("Image reference cannot be empty");
     }
 
-    std::string remainder = ref;
-    std::string registry = "registry-1.docker.io";
-
-    auto first_slash = remainder.find('/');
-    if (first_slash != std::string::npos) {
-        std::string first_part = remainder.substr(0, first_slash);
-        if (first_part.find('.') != std::string::npos ||
-            first_part.find(':') != std::string::npos ||
-            first_part == "localhost") {
-            registry = (first_part == "docker.io") ? "registry-1.docker.io" : first_part;
-            remainder = remainder.substr(first_slash + 1);
-        }
+    auto first_slash = ref.find('/');
+    if (first_slash == std::string::npos) {
+        throw std::invalid_argument(
+            "Image reference '" + ref + "' has no OCI registry host. "
+            "Docker Hub is disabled; specify an explicit non-Docker-Hub registry (e.g. ghcr.io/org/img:tag, "
+            "quay.io/org/img:tag, localhost:5000/img:tag) or use a built-in distro tag / FROM_URL.");
     }
 
+    std::string first_part = ref.substr(0, first_slash);
+    bool looks_like_registry = (first_part.find('.') != std::string::npos ||
+                                first_part.find(':') != std::string::npos ||
+                                first_part == "localhost");
+    if (!looks_like_registry) {
+        throw std::invalid_argument(
+            "Image reference '" + ref + "' must include an explicit OCI registry host "
+            "(Docker Hub is disabled). Example: ghcr.io/" + ref);
+    }
+
+    if (is_docker_hub_registry(first_part)) {
+        throw std::invalid_argument(
+            "Docker Hub registry '" + first_part + "' is disabled in Pieces. "
+            "Use ghcr.io, quay.io, registry.fedoraproject.org, a private registry, or FROM_URL.");
+    }
+
+    std::string registry = first_part;
+    std::string remainder = ref.substr(first_slash + 1);
     if (remainder.empty()) {
         throw std::invalid_argument("Image reference missing repository: '" + ref + "'");
     }
@@ -235,10 +329,6 @@ ImageReference parse_image_reference(const std::string& ref) {
     if (last_colon != std::string::npos && (last_slash == std::string::npos || last_colon > last_slash)) {
         tag = remainder.substr(last_colon + 1);
         remainder = remainder.substr(0, last_colon);
-    }
-
-    if (registry == "registry-1.docker.io" && remainder.find('/') == std::string::npos) {
-        remainder = "library/" + remainder;
     }
 
     if (remainder.empty() || tag.empty()) {
@@ -401,6 +491,7 @@ bool pull_oci_image(
             if (arch_resp.status_code < 200 || arch_resp.status_code >= 300) {
                 throw std::runtime_error("Arch manifest fetch failed with HTTP " + std::to_string(arch_resp.status_code));
             }
+            verify_sha256_digest_str(*digest, sha256_string(arch_resp.body), "arch manifest");
             manifest = JsonValue::parse(arch_resp.body);
         }
 
@@ -412,9 +503,11 @@ bool pull_oci_image(
                     {},
                     token,
                     get_fn);
-                if (cfg_resp.status_code >= 200 && cfg_resp.status_code < 300) {
-                    meta = extract_oci_config_metadata(JsonValue::parse(cfg_resp.body));
+                if (cfg_resp.status_code < 200 || cfg_resp.status_code >= 300) {
+                    throw std::runtime_error("Config blob fetch failed with HTTP " + std::to_string(cfg_resp.status_code));
                 }
+                verify_sha256_digest_str(cfg_digest->as_string(), sha256_string(cfg_resp.body), "config blob");
+                meta = extract_oci_config_metadata(JsonValue::parse(cfg_resp.body));
             }
         }
 
@@ -429,10 +522,11 @@ bool pull_oci_image(
             if (!digest_v || !digest_v->is_string()) {
                 throw std::runtime_error("Layer entry missing digest");
             }
-            std::cout << "PULL: Downloading & extracting layer " << (i + 1) << "/" << layer_arr.size()
-                      << " (" << digest_v->as_string().substr(0, 19) << ")...\n";
+            const std::string& expected_digest = digest_v->as_string();
+            std::cout << "PULL: Downloading, verifying & extracting layer " << (i + 1) << "/" << layer_arr.size()
+                      << " (" << expected_digest.substr(0, 19) << ")...\n";
             HttpResponse layer_resp = registry_get_with_auth(
-                base_url + "/blobs/" + digest_v->as_string(),
+                base_url + "/blobs/" + expected_digest,
                 {},
                 token,
                 get_fn,
@@ -440,6 +534,7 @@ bool pull_oci_image(
             if (layer_resp.status_code < 200 || layer_resp.status_code >= 300) {
                 throw std::runtime_error("Layer blob download failed with HTTP " + std::to_string(layer_resp.status_code));
             }
+            verify_sha256_digest_str(expected_digest, sha256_file(tmp_blob.string()), "layer " + std::to_string(i + 1));
             safe_extract_tar_file(tmp_blob.string(), staging_dir.string(), true);
             fs::remove(tmp_blob, ec);
         }
@@ -466,7 +561,7 @@ bool pull_oci_image(
             fs::remove_all(backup_dir, ec);
         }
 
-        std::cout << "PULL: Image ready at " << dest_image_path << "\n";
+        std::cout << "PULL: Verified and unpacked image to " << dest_image_path << "\n";
         return true;
     } catch (const std::exception& exc) {
         std::cerr << "PULL: Failed to pull '" << image_ref << "': " << exc.what() << "\n";

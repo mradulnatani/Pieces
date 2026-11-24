@@ -18,6 +18,7 @@ enum class CliCommand {
     Exec,
     Rm,
     Rmi,
+    Prune,
 };
 
 struct CliArgs {
@@ -26,6 +27,7 @@ struct CliArgs {
     // build
     std::string context;
     std::optional<std::string> tag;
+    bool no_cache{false};
 
     // pull
     std::string pull_ref;
@@ -34,11 +36,19 @@ struct CliArgs {
     std::optional<std::string> name;
     bool auto_remove{false};
     bool detach{false};
+    bool interactive{false};
+    bool allocate_tty{false};
     bool rootless{false};
+    bool privileged{false};
+    std::string restart_policy{"no"};
+    std::string log_max_size{"10m"};
+    int log_max_files{3};
     std::string network_mode{"bridge"};
     std::vector<std::string> env_specs;
     std::vector<std::string> volume_specs;
     std::vector<std::string> port_specs;
+    std::vector<std::string> cap_add;
+    std::vector<std::string> cap_drop;
     std::optional<std::string> memory_limit;
     std::optional<double> cpu_limit;
     std::optional<int> pids_limit;

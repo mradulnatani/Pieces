@@ -47,9 +47,16 @@ std::string to_upper(std::string s) {
     return s;
 }
 
+std::string to_lower(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
 const std::set<std::string>& supported_instructions() {
     static const std::set<std::string> kSupported = {
-        "FROM", "FROM_URL", "ENV", "WORKDIR", "COPY", "RUN", "CMD", "ENTRYPOINT",
+        "FROM", "FROM_URL", "SHA256", "ENV", "WORKDIR", "COPY", "RUN", "CMD", "ENTRYPOINT",
     };
     return kSupported;
 }
@@ -302,6 +309,15 @@ std::optional<PiecefileSpec> parse_piecefile(const std::string& path) {
                 spec.from_image = value;
             } else if (keyword == "FROM_URL") {
                 spec.from_url = value;
+            } else if (keyword == "SHA256") {
+                std::string hex = to_lower(value);
+                if (hex.rfind("sha256:", 0) == 0) {
+                    hex = hex.substr(7);
+                }
+                if (hex.size() != 64 || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) { return std::isxdigit(c); })) {
+                    throw std::invalid_argument("SHA256 must be a 64-character hex digest");
+                }
+                spec.sha256 = hex;
             } else if (keyword == "ENV") {
                 for (const auto& [k, v] : parse_env_assignments(value)) {
                     spec.env[k] = v;

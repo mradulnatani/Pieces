@@ -1,17 +1,21 @@
 #include "pieces/namespaces.hpp"
 
 #include <fcntl.h>
+#include <pwd.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -39,6 +43,44 @@ void write_exact_file(const fs::path& path, const std::string& content) {
     }
 }
 
+bool command_in_path(const std::string& cmd) {
+    const char* path_env = std::getenv("PATH");
+    if (!path_env) return false;
+    std::string path_str(path_env);
+    size_t start = 0;
+    while (start <= path_str.size()) {
+        size_t colon = path_str.find(':', start);
+        std::string dir = (colon == std::string::npos) ? path_str.substr(start) : path_str.substr(start, colon - start);
+        if (!dir.empty() && ::access((fs::path(dir) / cmd).c_str(), X_OK) == 0) {
+            return true;
+        }
+        if (colon == std::string::npos) break;
+        start = colon + 1;
+    }
+    return false;
+}
+
+int run_quiet_helper(const std::vector<std::string>& args) {
+    pid_t p = ::fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        int dn = ::open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            ::dup2(dn, STDOUT_FILENO);
+            ::dup2(dn, STDERR_FILENO);
+            ::close(dn);
+        }
+        std::vector<char*> argv;
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execvp(argv[0], argv.data());
+        ::_exit(127);
+    }
+    int st = 0;
+    if (::waitpid(p, &st, 0) < 0) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
 void ensure_dev_node(
     const char* dev_name,
     unsigned int maj,
@@ -59,7 +101,6 @@ void ensure_dev_node(
         }
     }
 
-    // Rootless fallback: bind-mount device node from /old_root/dev before unmounting /old_root
     std::string host_dev = std::string("/old_root/dev/") + dev_name;
     if (fs::exists(host_dev, ec)) {
         int fd = ::open(target.c_str(), O_WRONLY | O_CREAT, 0666);
@@ -96,6 +137,44 @@ void apply_bind_mounts(const fs::path& rootfs_real, const std::vector<VolumeMoun
         checked_mount(vol.host_path.c_str(), target.c_str(), nullptr, MS_BIND | MS_REC, nullptr);
         if (vol.read_only) {
             checked_mount(nullptr, target.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+        }
+    }
+}
+
+void mask_sensitive_proc_and_sys_paths() {
+    std::error_code ec;
+    // Remount /proc/sys read-only
+    if (fs::exists("/proc/sys", ec)) {
+        if (::mount("/proc/sys", "/proc/sys", nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+            ::mount(nullptr, "/proc/sys", nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+        }
+    }
+    // Remount /sys read-only
+    if (fs::exists("/sys", ec)) {
+        ::mount(nullptr, "/sys", nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+    }
+
+    const char* masked_files[] = {
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/timer_list",
+        "/proc/sched_debug",
+        "/proc/latency_stats",
+    };
+    for (const char* p : masked_files) {
+        if (fs::exists(p, ec)) {
+            ::mount("/dev/null", p, nullptr, MS_BIND, nullptr);
+        }
+    }
+
+    const char* masked_dirs[] = {
+        "/proc/acpi",
+        "/proc/scsi",
+        "/sys/firmware",
+    };
+    for (const char* d : masked_dirs) {
+        if (fs::is_directory(d, ec)) {
+            ::mount("tmpfs", d, "tmpfs", MS_RDONLY, "mode=000");
         }
     }
 }
@@ -138,6 +217,38 @@ void pivot_root_dir(const std::string& new_root, const std::string& put_old) {
     }
 }
 
+std::optional<SubIdRange> parse_subid_range(
+    const std::string& subid_file_path,
+    const std::string& username) {
+    std::ifstream in(subid_file_path);
+    if (!in) {
+        return std::nullopt;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        std::string user, start_s, count_s;
+        if (!std::getline(iss, user, ':') ||
+            !std::getline(iss, start_s, ':') ||
+            !std::getline(iss, count_s, ':')) {
+            continue;
+        }
+        if (user == username) {
+            try {
+                uint32_t start = static_cast<uint32_t>(std::stoul(start_s));
+                uint32_t count = static_cast<uint32_t>(std::stoul(count_s));
+                if (count > 0) {
+                    return SubIdRange{start, count};
+                }
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 void write_user_namespace_maps(
     const std::string& proc_dir_for_pid,
     uid_t host_uid,
@@ -152,9 +263,44 @@ void write_user_namespace_maps(
     write_exact_file(proc_dir / "gid_map", "0 " + std::to_string(host_gid) + " 1\n");
 }
 
+void setup_rootless_user_namespace(
+    pid_t target_pid,
+    uid_t host_uid,
+    gid_t host_gid) {
+    if (target_pid != ::getpid() && command_in_path("newuidmap") && command_in_path("newgidmap")) {
+        struct passwd pwd{};
+        struct passwd* res = nullptr;
+        char buf[1024];
+        if (::getpwuid_r(host_uid, &pwd, buf, sizeof(buf), &res) == 0 && res && res->pw_name) {
+            auto subuid = parse_subid_range("/etc/subuid", res->pw_name);
+            auto subgid = parse_subid_range("/etc/subgid", res->pw_name);
+            if (subuid.has_value() && subgid.has_value()) {
+                std::string pid_s = std::to_string(target_pid);
+                int r1 = run_quiet_helper({
+                    "newuidmap", pid_s,
+                    "0", std::to_string(host_uid), "1",
+                    "1", std::to_string(subuid->start), std::to_string(subuid->count)
+                });
+                int r2 = run_quiet_helper({
+                    "newgidmap", pid_s,
+                    "0", std::to_string(host_gid), "1",
+                    "1", std::to_string(subgid->start), std::to_string(subgid->count)
+                });
+                if (r1 == 0 && r2 == 0) {
+                    return;
+                }
+            }
+        }
+    }
+
+    std::string proc_path = (target_pid == ::getpid())
+                                ? "/proc/self"
+                                : ("/proc/" + std::to_string(target_pid));
+    write_user_namespace_maps(proc_path, host_uid, host_gid);
+}
+
 void enter_container_namespaces(int target_pid) {
     std::string pid_str = std::to_string(target_pid);
-    // Enter user namespace first (if distinct) so setns on remaining namespaces succeeds.
     const char* ns_names[] = {"user", "ipc", "uts", "net", "pid", "mnt"};
     for (const char* ns : ns_names) {
         std::string ns_path = "/proc/" + pid_str + "/ns/" + ns;
@@ -222,7 +368,8 @@ VolumeMount parse_volume_spec(const std::string& spec) {
 void setup_container_mounts(
     const std::string& rootfs_dir,
     const std::vector<VolumeMount>& volumes,
-    bool rootless) {
+    bool rootless,
+    bool harden_proc_sys) {
     checked_mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
 
     fs::path rootfs_real = fs::weakly_canonical(fs::absolute(rootfs_dir));
@@ -244,7 +391,6 @@ void setup_container_mounts(
         if (!rootless || (errno != EPERM && errno != EACCES)) {
             throw_errno("mount(sysfs -> /sys)");
         }
-        // Rootless fallback: bind-mount host /sys read-only if permitted
         ::mount("/old_root/sys", "/sys", nullptr, MS_BIND | MS_REC | MS_RDONLY, nullptr);
     }
 
@@ -277,10 +423,13 @@ void setup_container_mounts(
         }
     }
 
-    // Unmount old_root last so rootless /dev and /sys bind-mounts can reference /old_root
     checked_umount2("/old_root", MNT_DETACH);
     if (::rmdir("/old_root") != 0) {
         throw_errno("rmdir(/old_root)");
+    }
+
+    if (harden_proc_sys) {
+        mask_sensitive_proc_and_sys_paths();
     }
 }
 

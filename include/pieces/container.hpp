@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <string>
@@ -10,17 +11,32 @@
 
 namespace pieces {
 
+enum class RestartPolicy {
+    No,
+    OnFailure,
+    Always,
+    UnlessStopped,
+};
+
 struct ContainerRunConfig {
     std::string image;
     std::vector<std::string> cmd_args;
     std::optional<std::string> name;
     bool auto_remove{false};
     bool detach{false};
+    bool interactive{false};
+    bool allocate_tty{false};
     bool rootless{false};
+    bool privileged{false};
+    RestartPolicy restart_policy{RestartPolicy::No};
+    std::size_t log_max_bytes{10ULL * 1024ULL * 1024ULL};
+    int log_max_files{3};
     std::string network_mode{"bridge"};
     std::vector<std::string> env_specs;
     std::vector<std::string> volume_specs;
     std::vector<std::string> port_specs;
+    std::vector<std::string> cap_add;
+    std::vector<std::string> cap_drop;
     std::optional<std::string> memory_limit;
     std::optional<double> cpu_limit;
     std::optional<int> pids_limit;
@@ -29,6 +45,26 @@ struct ContainerRunConfig {
     std::string image_dir{IMAGE_DIR};
     std::string containers_dir{CONTAINERS_DIR};
 };
+
+class RotatingLogWriter {
+public:
+    RotatingLogWriter(std::string base_path, std::size_t max_bytes, int max_files);
+    void write(const char* data, std::size_t len);
+    void flush();
+
+private:
+    void rotate();
+
+    std::string base_path_;
+    std::size_t max_bytes_;
+    int max_files_;
+    std::size_t current_bytes_{0};
+    int fd_{-1};
+};
+
+[[nodiscard]] RestartPolicy parse_restart_policy(const std::string& spec);
+[[nodiscard]] std::string restart_policy_to_string(RestartPolicy policy);
+[[nodiscard]] std::size_t parse_byte_size(const std::string& spec);
 
 [[nodiscard]] JsonObject load_image_metadata(const std::string& image_path);
 [[nodiscard]] std::vector<std::string> resolve_command(
@@ -60,6 +96,7 @@ int exec_in_container(
     const std::vector<std::string>& cmd_args,
     const std::vector<std::string>& env_specs = {},
     const std::optional<std::string>& workdir = std::nullopt,
+    bool allocate_tty = false,
     const std::string& containers_dir = CONTAINERS_DIR);
 int run_container(const ContainerRunConfig& config);
 

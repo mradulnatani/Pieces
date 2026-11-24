@@ -7,13 +7,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(CURL REQUIRED)
 find_package(LibArchive REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBCAP REQUIRED IMPORTED_TARGET libcap)
 
 add_library(pieces_core STATIC
     src/json.cpp
     src/parser.cpp
     src/cli.cpp
-    src/filesystem.cpp
     src/registry.cpp
+    src/filesystem.cpp
+    src/security.cpp
     src/namespaces.cpp
     src/cgroup.cpp
     src/network.cpp
@@ -29,6 +33,9 @@ target_link_libraries(pieces_core
     PUBLIC
         CURL::libcurl
         LibArchive::LibArchive
+        OpenSSL::Crypto
+        PkgConfig::LIBCAP
+        util
 )
 
 target_compile_options(pieces_core
