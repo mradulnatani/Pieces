@@ -1,5 +1,5 @@
-# The recipe for our Alpine Linux container
+# Recipe for an Ubuntu 22.04 base container
 FROM ubuntu:22.04
 
-# The default command to run when the container starts
+# Default command to run when the container starts
 CMD /bin/sh
