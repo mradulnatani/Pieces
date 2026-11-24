@@ -1,4 +1,5 @@
 #include "pieces/namespaces.hpp"
+#include "pieces/filesystem.hpp"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -387,7 +388,7 @@ void enter_container_namespaces(int target_pid) {
     }
 }
 
-VolumeMount parse_volume_spec(const std::string& spec) {
+VolumeMount parse_volume_spec(const std::string& spec, const std::string& volumes_dir) {
     std::vector<std::string> parts;
     size_t start = 0;
     while (true) {
@@ -401,10 +402,11 @@ VolumeMount parse_volume_spec(const std::string& spec) {
     }
 
     if (parts.size() != 2 && parts.size() != 3) {
-        throw std::invalid_argument("Invalid volume specification '" + spec + "'; expected HOST:CONTAINER[:ro]");
+        throw std::invalid_argument("Invalid volume specification '" + spec + "'; expected HOST_OR_VOL:CONTAINER[:ro]");
     }
 
-    fs::path host_abs = fs::absolute(parts[0]);
+    std::string resolved_host = resolve_volume_host_path(parts[0], volumes_dir);
+    fs::path host_abs = fs::absolute(resolved_host);
     const std::string& container_path = parts[1];
     bool read_only = false;
     if (parts.size() == 3) {
@@ -422,6 +424,19 @@ VolumeMount parse_volume_spec(const std::string& spec) {
     }
 
     return {host_abs.string(), container_path, read_only};
+}
+
+TmpfsMount parse_tmpfs_spec(const std::string& spec) {
+    if (spec.empty()) {
+        throw std::invalid_argument("Empty --tmpfs specification");
+    }
+    auto colon = spec.find(':');
+    std::string cpath = (colon == std::string::npos) ? spec : spec.substr(0, colon);
+    std::string opts = (colon == std::string::npos) ? "" : spec.substr(colon + 1);
+    if (cpath.empty() || cpath.front() != '/') {
+        throw std::invalid_argument("--tmpfs destination must be an absolute path: '" + cpath + "'");
+    }
+    return {cpath, opts};
 }
 
 void prepare_hybrid_tmpfs_rootfs(const fs::path& lower_real, const fs::path& merged_real) {
@@ -515,7 +530,8 @@ void setup_container_mounts(
     bool readonly_rootfs,
     const std::vector<std::string>& extra_masked_paths,
     const std::vector<std::string>& extra_readonly_paths,
-    const std::optional<OverlayRootfsSpec>& overlay_spec) {
+    const std::optional<OverlayRootfsSpec>& overlay_spec,
+    const std::vector<TmpfsMount>& tmpfs_mounts) {
     checked_mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
 
     fs::path rootfs_real = fs::weakly_canonical(fs::absolute(rootfs_dir));
@@ -524,6 +540,19 @@ void setup_container_mounts(
     }
 
     apply_bind_mounts(rootfs_real, volumes);
+
+    for (const auto& tm : tmpfs_mounts) {
+        std::string rel = tm.container_path;
+        while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+        fs::path target = fs::weakly_canonical(rootfs_real / rel);
+        auto relative_check = target.lexically_relative(rootfs_real);
+        if (relative_check.empty() || (*relative_check.begin() == "..")) {
+            throw std::invalid_argument("tmpfs destination escapes rootfs: '" + tm.container_path + "'");
+        }
+        fs::create_directories(target);
+        const char* opts = tm.options.empty() ? nullptr : tm.options.c_str();
+        checked_mount("tmpfs", target.c_str(), "tmpfs", 0, opts);
+    }
 
     checked_mount(rootfs_real.c_str(), rootfs_real.c_str(), "bind", MS_BIND | MS_REC, nullptr);
     fs::path old_root = rootfs_real / "old_root";

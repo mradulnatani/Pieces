@@ -29,9 +29,9 @@ Unlike high-level tutorials that stop at `run` examples, this book walks through
   - [Chapter 14: Wiring Pieces into `containerd` & Kubernetes](#chapter-14-wiring-pieces-into-containerd--kubernetes)
   - [Chapter 15: Performance Engineering & `--timing` Benchmarks](#chapter-15-performance-engineering--timing-benchmarks)
 - [Part VI — Integration Recipes & Complete Technical Reference](#part-vi--integration-recipes--complete-technical-reference)
-  - [Chapter 16: Real-World Project Integration Recipes](#chapter-16-real-world-project-integration-recipes)
+  - [Chapter 16: Real-World Project Integration Recipes, Compose & REST API](#chapter-16-real-world-project-integration-recipes-compose--rest-api)
   - [Appendix A: Complete CLI & Flag Reference](#appendix-a-complete-cli--flag-reference)
-  - [Appendix B: `Piecefile` & JSON State Schema Reference](#appendix-b-piecefile--json-state-schema-reference)
+  - [Appendix B: `Piecefile` / `Dockerfile` & JSON State Schema Reference](#appendix-b-piecefile--dockerfile--json-state-schema-reference)
   - [Appendix C: On-Disk & Virtual Filesystem State Map](#appendix-c-on-disk--virtual-filesystem-state-map)
   - [Appendix D: Troubleshooting & Diagnostics Guide](#appendix-d-troubleshooting--diagnostics-guide)
 
@@ -168,7 +168,7 @@ ctest --test-dir build --output-on-failure
 ./build/pieces_tests
 ```
 
-`tests/test_pieces.cpp` runs 5 self-contained C++ test suites using `TempDir` RAII scratch directories and `libarchive` tar fixture generators:
+`tests/test_pieces.cpp` runs 6 self-contained C++ test suites using `TempDir` RAII scratch directories and `libarchive` tar fixture generators:
 
 | Test Function | What It Verifies |
 | --- | --- |
@@ -177,6 +177,7 @@ ctest --test-dir build --output-on-failure
 | `test_allowlist_seccomp_oci_json_user_and_mac` | Confirms `read`/`write`/`execve` are in `default_allowed_syscalls()` while `unshare`, `setns`, `chroot`, `bpf`, `ptrace`, `mount` are **excluded**; builds BPF filter and verifies default-deny final action; compiles OCI seccomp JSON; validates `parse_user_spec`, `apply_process_user(..., true)` failing on UID 0, and `parse_security_opts`. |
 | `test_oci_runtime_spec_and_cgroup_stats` | Generates default rootless OCI spec, parses a full Kubernetes/containerd `config.json` (UID/GIDs, capabilities, AppArmor, SELinux, `kubepods.slice`, shared namespace paths, `uidMappings`/`gidMappings`, resources, seccomp, annotations, hooks), parses signals, and verifies `read_cgroup_stats`. |
 | `test_oci_pull_no_docker_hub_and_ipam_logs` | Rejects `ubuntu:22.04`, `docker.io/...`, `registry-1.docker.io/...` in `parse_image_reference`; tests `allocate_container_ip`/`release_container_ip`; verifies `RotatingLogWriter` file rotation; verifies `../escape.txt` rejection in `safe_extract_tar_file`; tests `readonly-bind` zero-copy and `in-ns-overlay` preparation/cleanup. |
+| `test_docker_parity_build_cli_volumes_auth_net_compose_api` | End-to-end parity suite verifying `Dockerfile` fallback, multi-stage `FROM_URL ... AS`, `COPY --from` + `.dockerignore`, `ARG`/`ADD`/`USER`/`LABEL`/`EXPOSE`/`VOLUME`, `tag_image` & `inspect_image_json`, local base `FROM`, `--flag=val` + `--net=host` + `--entrypoint` + `--tmpfs` + `--add-host` + `--dns` + `env-file`, named volumes, `cp`, `save_registry_credentials`/`load_registry_basic_auth`, custom `network` + `EmbeddedDnsServer`, `compose` YAML + `topo_sort_services`, and Docker REST API handlers. |
 
 ### 2.4 Live Kernel Host Verification (`scripts/verify_host.sh`)
 
@@ -338,25 +339,36 @@ Tarballs from registries or external URLs can be malformed or malicious. In [src
 - **Word & Quote Splitting (`split_shell_words`):** Preserves single-quoted `'...'` and double-quoted `"..."` strings and backslash escapes (`KEY="hello world"`).
 - **Command Parsing (`parse_command_value`):** Automatically detects JSON exec-form (`["/bin/sh", "-c"]`) vs shell-form (`python3 app.py` → `{"/bin/sh", "-c", "python3 app.py"}`).
 
-### 6.2 Supported `Piecefile` Instructions
+### 6.2 Supported `Piecefile` & `Dockerfile` Instructions
+
+`resolve_piecefile_path` checks `--file`/`-f`, then `<context>/Piecefile`, and falls back automatically to `<context>/Dockerfile`.
 
 | Instruction | Syntax Examples | Effect |
 | --- | --- | --- |
-| `FROM` | `FROM alpine:3.18` or `FROM ghcr.io/org/base:v1` | Sets base distro CDN tarball or non-Docker-Hub OCI registry image. |
-| `FROM_URL` | `FROM_URL https://example.com/rootfs.tar.gz` | Sets direct tarball URL base. Also sets default image name derived from archive basename if `--tag` is omitted. |
+| `FROM` | `FROM alpine:3.18 [AS builder]` or `FROM my-local-img` | Sets base distro CDN tarball, existing local image in `.pieces/images/`, or non-Docker-Hub OCI registry image; starts a named build stage when `AS <stage>` is specified. |
+| `FROM_URL` | `FROM_URL https://example.com/rootfs.tar.gz [AS stage1]` | Sets direct tarball URL base (with optional `AS <stage>` alias). Also sets default image name derived from archive basename if `--tag` is omitted. |
 | `SHA256` | `SHA256 <64-hex>` or `SHA256 sha256:<64-hex>` | Enforces exact SHA-256 verification on downloaded/cached tarball before extraction. Throws immediately on mismatch. |
+| `ARG` | `ARG VER=1.2.3` or `ARG BUILD_ENV` | Declares build-time variable (overridable via `--build-arg KEY=VAL`); supports `${VAR}` / `${VAR:-default}` expansion across subsequent instructions. |
 | `ENV` | `ENV FOO=bar BAZ="hello world"` or `ENV KEY VALUE` | Updates `build_env` immediately for subsequent `RUN` steps and persists into `.pieces_meta.json`. |
 | `WORKDIR` | `WORKDIR /app` | Creates directory inside `staging_dir` and updates `build_workdir` for subsequent `RUN` steps + `.pieces_meta.json`. |
-| `COPY` | `COPY ./src /app/src` | Validates source doesn't escape `context_dir` and destination stays inside `staging_dir`, preserving symlinks and overwriting existing targets. |
+| `USER` | `USER 1000:1000` | Records default container UID[:GID] in `.pieces_meta.json` (used automatically when `--user` is omitted at `run`). |
+| `COPY` | `COPY [--from=stage1] [--chown=1000:1000] ./src /app/src` | Copies from host build context (respecting `.piecesignore`/`.dockerignore`) or an earlier stage's rootfs (`--from=`), with optional ownership change. |
+| `ADD` | `ADD [--chown=1000:1000] bundle.tar.gz /app/` or URL | Safely auto-extracts local/remote `.tar.*` archives or downloads plain files into the image rootfs. |
 | `RUN` | `RUN apk add --no-cache git` | Executes `/bin/sh -c "<cmd>"` inside an isolated build namespace rooted at `staging_dir`. Non-zero exit aborts the build atomically. |
+| `EXPOSE` | `EXPOSE 8080/tcp 9090` | Records declared container ports in `.pieces_meta.json` (`exposed_ports`). |
+| `VOLUME` | `VOLUME ["/data"]` | Records declared volume mountpoints in `.pieces_meta.json` (`volumes`). |
+| `LABEL` | `LABEL version=1.2.3 app="my demo"` | Stores key/value image metadata under `labels` in `.pieces_meta.json`. |
 | `ENTRYPOINT` | `ENTRYPOINT ["/usr/bin/env"]` | Persisted to `.pieces_meta.json`; prepended before `CMD` or CLI `cmd_args` at `run`. |
 | `CMD` | `CMD ["node", "server.js"]` | Persisted to `.pieces_meta.json`; used when CLI `cmd_args` is empty. |
 
-### 6.3 Download Cache & Build-Time `RUN` Execution
+### 6.3 Download Cache, Layer Cache, Multi-Stage & Build-Time `RUN`
 
-1. **SHA-256 Download Cache (`.pieces/cache/`):**
-   - Before downloading `FROM` distro tarballs or `FROM_URL` archives, `fetch_tarball_with_cache` computes `sha256_string(url) + ".tar"` inside `.pieces/cache/`.
-   - Unless `--no-cache` is passed, a cache hit avoids network transfer—and still re-runs `SHA256` checksum verification if `SHA256` is present in the `Piecefile`.
+1. **SHA-256 Download & Content-Addressed Layer Cache (`.pieces/cache/layers/`):**
+   - `fetch_tarball_with_cache` hashes URLs into `.pieces/cache/<sha256>.tar`.
+   - `build_image` additionally maintains a rolling `chain_hash` across `ARG`/`ENV`/`WORKDIR`/`USER`/`COPY`/`ADD`/`RUN` (hashing source file contents for `COPY`, ignoring entries matched by `.piecesignore` or `.dockerignore`). Unless `--no-cache` is passed, unchanged `COPY`/`RUN` steps restore snapshots directly from `.pieces/cache/layers/<chain_hash>`.
+2. **Multi-Stage Isolation & Registry Authentication:**
+   - Each `FROM ... AS <alias>` builds into its own `.staging-*` rootfs and stays available for `COPY --from=<alias>` in later stages. Only the final stage becomes `.pieces/images/<name>`.
+   - `save_registry_credentials` (`pieces login`) stores Base64 `user:password` under `.pieces/auth.json` (`chmod 0600`, Docker Hub still rejected). `pull_oci_image` reads both `.pieces/auth.json` and `~/.docker/config.json`, attaching `Authorization: Basic ...` during Bearer token exchanges or Basic challenges.
 2. **Ordered Instruction Replay (`build_image`):**
    - Unlike naive builders that execute all `COPY`s and then all `RUN`s, Pieces iterates `spec.instructions` **in exact source order**. Therefore `COPY package.json /app/package.json` followed by `RUN npm install` followed by `COPY . /app` behaves exactly as expected.
 3. **How `default_run_build_step` Isolates `RUN`:**
@@ -564,11 +576,20 @@ Pass `--no-isolate-net` to opt out when containers intentionally need peer-to-pe
 2. Reads `.pieces/containers/.ipam_leases.json` (which only tracks active leases—avoiding `O(total_containers)` scans over historical exited directories; full scan happens only once on cold start if `.ipam_leases.json` does not yet exist).
 3. Verifies each leased container's `meta.json` still has `status == "running"`, assigns the lowest free host IP in **`10.0.0.2` – `10.0.0.254`**, atomically writes `.ipam_leases.json`, and releases the lock.
 
-### 10.5 Per-Container `veth` Pair & `-p` Port Forwarding
+### 10.5 Custom Networks, Embedded DNS, Named Volumes & Rootless Userspace Networking
 
-- **Parent (`netlink_setup_host_veth`):** Generates interface names `vp-<id8>` (host side) and `vc-<id8>` (container peer, ≤ 15-char `IFNAMSIZ` safe), creates both atomically via `RTM_NEWLINK` (`VETH_INFO_PEER`), attaches `vp-*` to `pieces-br0` (`IFLA_MASTER`), brings `vp-*` `IFF_UP`, and moves `vc-*` into `pid2`'s network namespace (`IFLA_NET_NS_PID`).
-- **Child `pid2` (`configure_container_netns_netlink`):** Inside the new netns, brings `lo` `IFF_UP`, renames `vc-*` → `eth0`, adds `<container_ip>/24`, brings `eth0` `IFF_UP`, and installs default gateway `10.0.0.1` (`RTM_NEWROUTE`). Falls back cleanly to `ip -batch -` if Netlink fails on unusual kernels.
-- **Port Forwarding (`-p [HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`):** `setup_port_forwarding` adds `PREROUTING` DNAT, `OUTPUT` DNAT (making `curl 127.0.0.1:<HOST_PORT>` work from the host itself), and `FORWARD -p <proto> -d <container_ip> --dport <cont_port> -j ACCEPT`. All rules are deterministically deleted on exit/restart/removal (`cleanup_port_forwarding`).
+- **Custom User-Defined Networks (`pieces network create|ls|inspect|rm`):**
+  - Stored in `.pieces/networks/<name>.json` with auto-allocated `10.<N>.0.0/24` subnets, dedicated bridges (`pb-<hash8>`), and separate per-network `.ipam_leases_<name>.json` files. Unlike the hardened default `pieces-br0`, custom networks set `isolate=false` by default so containers on the same application network can communicate.
+- **Embedded UDP DNS Server & Peer `/etc/hosts` Injection:**
+  - `EmbeddedDnsServer` (`src/network.cpp`) binds a UDP socket and responds dynamically (`build_dns_response`) to `A` queries for active container names (and `<name>.pieces`) from `.ipam_leases*.json` / `meta.json`. `run_container` also generates container `/etc/hosts` and `/etc/resolv.conf` overrides for peer containers, `--add-host HOST:IP`, and `--dns IP`.
+- **Rootless Userspace Networking (`pasta` / `slirp4netns`):**
+  - When running unprivileged (`use_userns && geteuid() != 0 && network_mode == "bridge"`), `setup_rootless_userspace_network` automatically attaches `pasta` (forwarding `-p` ports with `-t`/`-u`) or `slirp4netns` to `pid2`'s network namespace and cleans up the helper PID on container exit.
+- **Named Volumes (`pieces volume create|ls|inspect|rm`):**
+  - `-v myvol:/data[:ro]` without a path separator resolves to `.pieces/volumes/<name>/_data` via `resolve_volume_host_path`.
+- **Per-Container `veth` Pair & `-p` Port Forwarding:**
+  - **Parent (`netlink_setup_host_veth`):** Generates interface names `vp-<id8>` (host side) and `vc-<id8>` (container peer, ≤ 15-char `IFNAMSIZ` safe), creates both atomically via `RTM_NEWLINK` (`VETH_INFO_PEER`), attaches `vp-*` to the target bridge (`IFLA_MASTER`), brings `vp-*` `IFF_UP`, and moves `vc-*` into `pid2`'s network namespace (`IFLA_NET_NS_PID`).
+  - **Child `pid2` (`configure_container_netns_netlink`):** Inside the new netns, brings `lo` `IFF_UP`, renames `vc-*` → `eth0`, adds `<container_ip>/24`, brings `eth0` `IFF_UP`, and installs the network's default gateway (`RTM_NEWROUTE`). Falls back cleanly to `ip -batch -` if Netlink fails.
+  - **Port Forwarding (`-p [HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`):** `setup_port_forwarding` adds `PREROUTING` DNAT, `OUTPUT` DNAT (for `127.0.0.1` host loopback), and `FORWARD` `ACCEPT` rules, cleaned up deterministically on exit/restart/removal (`cleanup_port_forwarding`).
 
 ---
 
@@ -788,7 +809,7 @@ sudo ./build/pieces run --rm --read-only --timing --net none ubuntu-22.04 /bin/t
 
 # Part VI — Integration Recipes & Complete Technical Reference
 
-## Chapter 16: Real-World Project Integration Recipes
+## Chapter 16: Real-World Project Integration Recipes, Compose & REST API
 
 ### Recipe 1: Hardened Production Web API (`--read-only` + `--user` + cgroups + `-p`)
 
@@ -856,13 +877,38 @@ sudo ./build/pieces run --rm --net none --read-only \
 
 *(Note: verify your exact tarball SHA-256 first via `sha256sum` before pinning `SHA256` in a production `Piecefile`.)*
 
-### Recipe 4: Communicating Sidecars (`--no-isolate-net`)
+### Recipe 4: Multi-Service Stack with `pieces compose` & Docker REST Socket (`pieces serve`)
 
-By default, `ensure_bridge_isolation` drops container-to-container packets on `pieces-br0`. When a web container intentionally talks directly to a database container IP shown in `pieces ps`:
+Create a `compose.yaml`:
+```yaml
+services:
+  db:
+    image: alpine:3.18
+    volumes:
+      - dbdata:/var/lib/data
+    environment:
+      APP_MODE: database
+    command: ["/bin/sh", "-c", "sleep 300"]
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+    env_file:
+      - .env
+volumes:
+  dbdata:
+```
 
+Run the stack or start the optional Docker-compatible REST Unix socket (`handle_docker_api_request` in [src/daemon.cpp](file:///home/mradul/Desktop/GIT/Pieces/src/daemon.cpp)):
 ```bash
-sudo ./build/pieces run -d --name db --no-isolate-net postgres-local
-sudo ./build/pieces run --rm --no-isolate-net -e DB_HOST=10.0.0.2 my-client
+sudo ./build/pieces compose up -d --build
+sudo ./build/pieces compose ps
+sudo ./build/pieces compose down
+
+# Optional Docker Engine Unix socket shim (/_ping, /version, /info, /containers/..., /images/json, /volumes, /networks)
+sudo ./build/pieces serve --socket /run/pieces/docker.sock
 ```
 
 ---
@@ -871,23 +917,27 @@ sudo ./build/pieces run --rm --no-isolate-net -e DB_HOST=10.0.0.2 my-client
 
 ### Global Flag (Must Appear Before Subcommand)
 
-- `--root <dir>`: Override OCI runtime state directory (`create`, `start`, `state`, `kill`, `delete`).
+- `--root <dir>` (or `--root=<dir>`): Override OCI runtime state directory (`create`, `start`, `state`, `kill`, `delete`).
 
-### Native Image Commands
+### Native Image & Auth Commands
 
-- `pieces build <context> [-t/--tag <name>] [--no-cache]`
-- `pieces pull <registry>/<repo>[:tag] [-t/--tag <name>]` *(Docker Hub rejected)*
+- `pieces build <context> [-f/--file <Piecefile|Dockerfile>] [--build-arg KEY=VAL] [-t/--tag <name>] [--no-cache]`
+- `pieces pull <registry>/<repo>[:tag] [-t/--tag <name>]` *(Docker Hub rejected; reads `.pieces/auth.json` and `~/.docker/config.json`)*
+- `pieces login [-u/--username <user>] [-p/--password <pass>] [--password-stdin] <registry>`
+- `pieces tag <source_image> <target_image>`
 - `pieces images`
 - `pieces rmi <image> [<image>...]`
 
-### Native Container Commands
+### Native Container, Volume, Network, Compose & Daemon Commands
 
-- `pieces run [OPTIONS] <image> [--] [COMMAND [ARGS...]]`
+- `pieces run [OPTIONS] <image> [--] [COMMAND [ARGS...]]` *(supports `--flag=value` and combined `-d`/`-i`/`-t` short flags)*
   - **Identity & Lifecycle:** `--name <name>`, `--rm`, `-d`/`--detach`, `--restart no|on-failure|always|unless-stopped`, `--hostname <name>`, `--timing`
-  - **Execution & I/O:** `-i`/`--interactive`, `-t`/`--tty`, `-it`/`-ti`, `-e`/`--env KEY=VAL`, `-w`/`--workdir <dir>`, `-v`/`--volume HOST:CONTAINER[:ro|rw]`
+  - **Execution & I/O:** `-i`/`--interactive`, `-t`/`--tty`, `-it`/`-ti`/`-di`/`-dit`, `-e`/`--env KEY=VAL`, `--env-file <path>`, `--entrypoint <cmd>`, `-w`/`--workdir <dir>`, `-v`/`--volume HOST_OR_VOL:CONTAINER[:ro|rw]`, `--tmpfs <CONTAINER_PATH[:opts]>`
   - **Security & Isolation:** `-u`/`--user UID[:GID]`, `--run-as-non-root`, `--read-only`, `--seccomp-profile <json_path>`, `--security-opt apparmor=<profile>|label=<context>`, `--cap-add <CAP|ALL>`, `--cap-drop <CAP|ALL>`, `--privileged`, `--rootless`/`--userns`, `--full-copy`
-  - **Networking:** `--net bridge|none`, `-p`/`--publish [HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`, `--no-isolate-net`
+  - **Networking:** `--net`/`--network bridge|none|host|<custom_net>`, `-p`/`--publish [HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`, `--no-isolate-net`, `--add-host <HOST:IP>`, `--dns <IP>`
   - **Resources & Logs:** `--memory <limit>` (`b|k|kb|m|mb|g|gb|t|tb`), `--cpus <float>`, `--pids-max <int>`, `--log-max-size <size>`, `--log-max-files <int>`
+- `pieces inspect <container|image>`
+- `pieces cp <CONTAINER:PATH HOST_PATH | HOST_PATH CONTAINER:PATH>`
 - `pieces ps [-a/--all]`
 - `pieces stop [-t/--time <seconds>] <id|name>...`
 - `pieces logs [-f/--follow] [-n/--tail <lines>] <id|name>`
@@ -895,6 +945,10 @@ sudo ./build/pieces run --rm --no-isolate-net -e DB_HOST=10.0.0.2 my-client
 - `pieces stats <id|name>`
 - `pieces rm [-f/--force] <id|name>...`
 - `pieces prune`
+- `pieces volume <create|ls|inspect|rm> [NAME...]`
+- `pieces network <create [--subnet CIDR]|ls|inspect|rm> [NAME...]`
+- `pieces compose [-f/--file <compose.yaml>] <up [-d] [--build] | down | ps | logs [-f] [-n N]>`
+- `pieces serve [--socket <unix_socket_path>]`
 
 ### OCI Runtime Specification Commands
 
@@ -907,7 +961,7 @@ sudo ./build/pieces run --rm --no-isolate-net -e DB_HOST=10.0.0.2 my-client
 
 ---
 
-## Appendix B: `Piecefile` & JSON State Schema Reference
+## Appendix B: `Piecefile` / `Dockerfile` & JSON State Schema Reference
 
 ### Image Metadata (`.pieces/images/<name>/.pieces_meta.json`)
 
@@ -976,17 +1030,21 @@ Maps active `container_id -> assigned_ip` under `flock(LOCK_EX)` protection on `
 
 ```text
 .pieces/
+├── auth.json                         Saved OCI registry credentials (`pieces login`, chmod 0600)
 ├── cache/
-│   └── <sha256(url)>.tar             Downloaded distro / FROM_URL tarball cache
+│   ├── <sha256(url)>.tar             Downloaded distro / FROM_URL tarball cache
+│   └── layers/<chain_hash>/          Content-addressed build layer snapshots
+├── volumes/<name>/_data/             Named container volumes (`pieces volume`)
+├── networks/<name>.json              User-defined container network configs (`pieces network`)
 ├── images/
 │   └── <image-name>/
-│       ├── .pieces_meta.json         CMD, ENTRYPOINT, ENV, WORKDIR defaults
+│       ├── .pieces_meta.json         CMD, ENTRYPOINT, ENV, USER, LABEL, EXPOSE, VOLUME, WORKDIR
 │       ├── etc/resolv.conf           Pre-seeded DNS configuration
 │       ├── etc/hosts                 Pre-seeded localhost & container entries
 │       └── ...                       Immutable unpacked base rootfs tree
 └── containers/
     ├── .ipam.lock                    Advisory flock mutex for IP allocation/release
-    ├── .ipam_leases.json             Active container_id -> IP lease map
+    ├── .ipam_leases*.json            Active per-network container_id -> IP lease maps
     └── <12-char-hex-id>/
         ├── meta.json                 Live state, PID, network, exit code, rootfs method
         ├── container.log[.1,.2,.N]   Rotating detached stdout/stderr logs
@@ -995,6 +1053,7 @@ Maps active `container_id -> assigned_ip` under `flock(LOCK_EX)` protection on `
 
 /dev/shm/.pieces-run/<id>/            RAM tmpfs scratch for ephemeral `--rm` non-detached runs
 /run/pieces/
+├── docker.sock                       Optional Docker Engine REST socket (`pieces serve`)
 ├── .net_ready_<bridge>_<nat>_<iso>   Host bridge & firewall fast-skip cache markers
 └── <oci-id>/
     ├── state.json                    OCI container state

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,22 @@ enum class CliCommand {
     Rm,
     Rmi,
     Prune,
+    Stats,
+    Inspect,
+    Tag,
+    Cp,
+    Volume,
+    Network,
+    Login,
+    Compose,
+    Serve,
+    // OCI Runtime Specification commands (runc/crun-compatible)
+    OciSpec,
+    OciCreate,
+    OciStart,
+    OciState,
+    OciKill,
+    OciDelete,
 };
 
 struct CliArgs {
@@ -27,10 +44,16 @@ struct CliArgs {
     // build
     std::string context;
     std::optional<std::string> tag;
+    std::string build_file;
+    std::map<std::string, std::string> build_args;
     bool no_cache{false};
 
-    // pull
+    // pull / login
     std::string pull_ref;
+    std::string login_registry;
+    std::string login_username;
+    std::string login_password;
+    bool password_stdin{false};
 
     // run
     std::optional<std::string> name;
@@ -40,13 +63,26 @@ struct CliArgs {
     bool allocate_tty{false};
     bool rootless{false};
     bool privileged{false};
+    bool readonly_rootfs{false};
+    bool full_copy{false};
+    bool run_as_non_root{false};
+    bool isolate_net{true};
+    bool timing{false};
     std::string restart_policy{"no"};
     std::string log_max_size{"10m"};
     int log_max_files{3};
     std::string network_mode{"bridge"};
+    std::optional<std::string> user_spec;
+    std::optional<std::string> seccomp_profile;
+    std::optional<std::string> entrypoint_override;
+    std::vector<std::string> security_opts;
     std::vector<std::string> env_specs;
+    std::vector<std::string> env_files;
     std::vector<std::string> volume_specs;
+    std::vector<std::string> tmpfs_specs;
     std::vector<std::string> port_specs;
+    std::vector<std::string> add_hosts;
+    std::vector<std::string> dns_servers;
     std::vector<std::string> cap_add;
     std::vector<std::string> cap_drop;
     std::optional<std::string> memory_limit;
@@ -63,10 +99,22 @@ struct CliArgs {
     // stop
     int timeout_sec{10};
 
-    // logs
+    // logs / exec / stats / inspect / tag / cp
     bool follow{false};
     int tail_lines{-1};
     std::string target_container;
+    std::string src_arg;
+    std::string dst_arg;
+
+    // volume / network
+    std::string sub_action;
+    std::string subnet_cidr;
+    std::vector<std::string> extra_args;
+
+    // compose / serve
+    std::string compose_file;
+    bool compose_build{false};
+    std::string socket_path{"/run/pieces/docker.sock"};
 
     // rm
     bool force{false};
@@ -74,6 +122,12 @@ struct CliArgs {
 
     // rmi
     std::vector<std::string> images;
+
+    // OCI runtime commands
+    std::string oci_bundle{"."};
+    std::string oci_pid_file;
+    std::string oci_state_root;
+    std::string oci_signal{"SIGTERM"};
 };
 
 void print_help();

@@ -1,42 +1,45 @@
 # Pieces
 
-**Pieces** is a lightweight, hardened, **OCI Runtime Spec–compatible** Linux container runtime written in **C++20**.
+**Pieces** is a lightweight, hardened, **OCI Runtime Spec–compatible** and **Docker-parity** Linux container runtime written in **C++20**.
 
-It executes containers directly using Linux kernel primitives—namespaces (`unshare`, `setns`), `pivot_root`, in-namespace OverlayFS with a fast hybrid `tmpfs` fallback, direct `NETLINK_ROUTE` networking, default-deny allowlist `seccomp-bpf`, `libcap` capability dropping, AppArmor/SELinux MAC labels, `/proc` & `/sys` masking, rootless `CLONE_NEWUSER` (`/etc/subuid` & `/etc/subgid`), and cgroups v2—while also implementing the `runc`/`crun`-style **OCI Runtime Specification** CLI (`spec`, `create`, `start`, `state`, `kill`, `delete`).
+It executes containers directly using Linux kernel primitives—namespaces (`unshare`, `setns`), `pivot_root`, in-namespace OverlayFS with a fast hybrid `tmpfs` fallback, direct `NETLINK_ROUTE` networking, default-deny allowlist `seccomp-bpf`, `libcap` capability dropping, AppArmor/SELinux MAC labels, `/proc` & `/sys` masking, rootless `CLONE_NEWUSER` (`/etc/subuid`, `/etc/subgid`, `pasta`/`slirp4netns`), and cgroups v2—while supporting `Dockerfile` multi-stage builds with layer caching, named volumes, custom networks + embedded DNS, `compose`, an opt-in Docker Unix socket REST API (`serve`), and the `runc`/`crun`-style **OCI Runtime Specification** CLI (`spec`, `create`, `start`, `state`, `kill`, `delete`).
 
-For the full book-length engineering manual documenting every C++ module, kernel syscall, CLI option, security layer, Netlink packet flow, and OCI/Kubernetes workflow, read **[TUTORIAL.md](TUTORIAL.md)**.
+For the full book-length engineering manual documenting every C++ module, kernel syscall, CLI option, security layer, Netlink packet flow, Compose engine, REST shim, and OCI/Kubernetes workflow, read **[TUTORIAL.md](TUTORIAL.md)**.
 
 ---
 
 ## Highlights
 
 - **Sub-10 ms startup engineering:** Zero-copy `--read-only` rootfs, in-namespace OverlayFS (or `< 1 ms` hybrid `tmpfs` + read-only bind-mount fallback), `/dev/shm/.pieces-run/` RAM scratch for `--rm`, zero-subprocess `NETLINK_ROUTE` `veth`/bridge setup, `flock`-locked `O(active)` IPAM, pre-built BPF filters, and skipped `userns` sync pipes when running as root.
+- **Docker-parity build & image workflow:** Supports both `Piecefile` and `Dockerfile` (`-f/--file` override), multi-stage `FROM ... AS <stage>` + `COPY --from=<stage>` + `--chown=`, content-addressed layer cache (`.pieces/cache/layers/`), `.piecesignore` / `.dockerignore`, local `FROM <image>`, `ARG`/`--build-arg`, `USER`, `ADD`, `EXPOSE`, `VOLUME`, `LABEL`, `$VAR` expansion, `tag`, and `inspect`.
 - **Hardened by default:** Default-deny **allowlist `seccomp-bpf`** (`AUDIT_ARCH` checked + `PR_SET_NO_NEW_PRIVS`, blocking `unshare`, `setns`, `chroot`, `mount`, `bpf`, `ptrace`, etc.), custom OCI `seccomp` JSON profiles (`--seccomp-profile`), `libcap` dropping (`--cap-drop`/`--cap-add`), `--read-only` rootfs, `--user` / `--run-as-non-root`, AppArmor/SELinux `--security-opt`, and default lateral/host bridge firewall isolation (`--no-isolate-net` to opt out).
-- **Supply-chain verified images (no Docker Hub):** Pulls from built-in upstream Linux CDNs (`alpine:3.18`, `fedora:38`, `ubuntu:22.04`), direct tarballs (`FROM_URL` + `SHA256`), or explicit non-Docker-Hub OCI v2 registries (`ghcr.io/...`, `quay.io/...`, `registry.fedoraproject.org/...`, `localhost:5000/...`) with OpenSSL `EVP_sha256()` verification and OCI whiteout extraction. Docker Hub (`docker.io`, `registry-1.docker.io`, etc.) is intentionally disabled.
-- **Full native & OCI lifecycle:** `Piecefile` builds with ordered `COPY`/`RUN`/`ENV`/`WORKDIR`, detached services (`-d`, `stop`, rotating `logs`, `--restart` backoff, `exec`, `stats`, `prune`), interactive PTY (`-it`), and OCI `create`/`start`/`state`/`kill`/`delete` + Pod Sandbox namespace joining.
+- **Supply-chain verified registries (no Docker Hub):** Pulls from built-in upstream Linux CDNs (`alpine:3.18`, `fedora:38`, `ubuntu:22.04`), direct tarballs (`FROM_URL` + `SHA256`), or explicit non-Docker-Hub OCI v2 registries (`ghcr.io/...`, `quay.io/...`, `registry.fedoraproject.org/...`, `localhost:5000/...`) with OpenSSL `EVP_sha256()` verification, OCI whiteout extraction, and `pieces login` / `~/.docker/config.json` auth. Docker Hub is intentionally disabled.
+- **Full runtime, volumes, networks, Compose & REST API:** `--net host|bridge|none|<custom_net>`, `--entrypoint`, `--env-file`, `--tmpfs`, `--add-host`, `--dns`, `cp`, `volume create|ls|inspect|rm`, `network create|ls|inspect|rm` with embedded UDP DNS responder, rootless `pasta`/`slirp4netns` networking, `compose up|down|ps|logs`, optional `serve` Docker REST Unix socket (`/_ping`, `/version`, `/info`, `/containers/...`, `/images/json`, `/volumes`, `/networks`), and OCI `create`/`start`/`state`/`kill`/`delete`.
 
 ---
 
 ## Architecture
 
 ```text
-CMakeLists.txt             CMake build (C++20, libcurl, libarchive, OpenSSL::Crypto, libcap, util)
+CMakeLists.txt             CMake build (C++20, libcurl, libarchive, OpenSSL::Crypto, libcap, util, pthread)
 include/pieces/*.hpp       Public C++ module headers
 src/
-├── main.cpp               CLI entry point (12 native commands + 6 OCI commands)
-├── cli.cpp                Subcommand, flag, and global `--root` argument parser
-├── parser.cpp             Piecefile parser (FROM, FROM_URL, SHA256, COPY, RUN, ENV, WORKDIR, CMD, ENTRYPOINT)
+├── main.cpp               CLI entry point (20 native commands + 6 OCI commands)
+├── cli.cpp                Subcommand, `--flag=val`, short-flag, and global `--root` parser
+├── parser.cpp             Piecefile/Dockerfile parser (multi-stage FROM..AS, ARG, USER, ADD, EXPOSE, VOLUME, LABEL)
 ├── json.cpp               Self-contained JsonValue recursive-descent parser & serializer
-├── registry.cpp           Non-Docker-Hub OCI v2 pull client (Bearer auth, multi-arch index, EVP SHA-256)
-├── filesystem.cpp         Cached libcurl downloads, safe libarchive + OCI whiteouts, build RUN, rootfs prep
+├── registry.cpp           Non-Docker-Hub OCI v2 pull client (Bearer + Basic auth, `~/.docker/config.json`, EVP SHA-256)
+├── filesystem.cpp         Cached downloads, safe tar + whiteouts, layer cache, `.dockerignore`, multi-stage build, volumes, tag
 ├── security.cpp           Default-deny allowlist seccomp-bpf, OCI seccomp JSON, libcap, AppArmor/SELinux, UID/GID
-├── namespaces.cpp         unshare, setns, in-ns OverlayFS / hybrid tmpfs, pivot_root, /dev & masked /proc,/sys
-├── network.cpp            Direct NETLINK_ROUTE bridge/veth/IP/route, bridge isolation firewall, flock IPAM, NAT/DNAT
+├── namespaces.cpp         unshare, setns, in-ns OverlayFS / hybrid tmpfs, pivot_root, tmpfs mounts, masked /proc,/sys
+├── network.cpp            NETLINK_ROUTE bridge/veth/IP/route, custom networks, EmbeddedDnsServer, flock IPAM, pasta/slirp4netns
 ├── cgroup.cpp             Cgroup v2 memory.max, cpu.max, pids.max, custom cgroupsPath, telemetry reader
-├── container.cpp          Supervisor, PTY relay, rotating logs, restart backoff, --timing profiler, orphan cleanup
+├── container.cpp          Supervisor, PTY relay, rotating logs, restart backoff, --timing, inspect, cp, env-file, hosts/dns
+├── compose.cpp            Compose YAML parser, depends_on topological sort, compose up/down/ps/logs
+├── daemon.cpp             Optional AF_UNIX HTTP/1.1 Docker REST API shim (`pieces serve`)
 └── oci_runtime.cpp        OCI Runtime Spec engine (spec, create, start, state, kill, delete, exec.fifo, hooks)
 tests/
-└── test_pieces.cpp        5 C++ unit test suites (runs unprivileged via ctest)
+└── test_pieces.cpp        6 C++ unit test suites (runs unprivileged via ctest)
 scripts/
 └── verify_host.sh         8-step live Linux kernel host verification script (requires sudo)
 ```
@@ -49,7 +52,7 @@ scripts/
 - **Build Toolchain:** CMake `3.20+`, C++20 compiler (`g++` 13+ or `clang++`), `pkg-config`.
 - **Libraries (`-dev` packages):** `libcurl`, `libarchive`, `openssl` (`libcrypto`), `libcap`.
 - **Runtime Privileges & Host Utilities:**
-  - `sudo` / `root` (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`) for bridge networking, `-p` port forwarding, and cgroup v2 limits; unprivileged users can run rootless (`CLONE_NEWUSER`) when host user namespaces are enabled (with optional `newuidmap`/`newgidmap` for `/etc/subuid` & `/etc/subgid`, and optional `fuse-overlayfs`).
+  - `sudo` / `root` (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`) for bridge networking, `-p` port forwarding, and cgroup v2 limits; unprivileged users can run rootless (`CLONE_NEWUSER`) with optional `newuidmap`/`newgidmap` (`/etc/subuid` & `/etc/subgid`), optional `fuse-overlayfs`, and optional `pasta` / `slirp4netns` for rootless networking.
   - `iptables` (optional, for NAT `MASQUERADE`, bridge isolation, and `-p` DNAT rules) and `ip` / `nsenter` (fallback only when `NETLINK_ROUTE` fails).
 
 ---
@@ -64,43 +67,52 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-### 2. Build an Image & Run Hardened Containers
+### 2. Multi-Stage Builds, Hardened Runs, Volumes & Compose
 
-Create a `Piecefile`:
+Build from a `Piecefile` or `Dockerfile`:
 
 ```dockerfile
+ARG BASE=alpine:3.18
+FROM $BASE AS builder
+WORKDIR /src
+COPY ./app /src
+RUN chmod +x /src/start.sh
+
 FROM alpine:3.18
-ENV APP_ENV=production
+USER 1000:1000
+EXPOSE 8080/tcp
+VOLUME ["/data"]
 WORKDIR /app
-COPY ./app /app
-RUN chmod +x /app/start.sh
+COPY --from=builder /src/start.sh /app/start.sh
 CMD ["/app/start.sh"]
 ```
 
-Build and run:
+Run containers, named volumes, custom networks, and Compose stacks:
 
 ```bash
-# Build image (uses .pieces/cache/ on repeat builds unless --no-cache is set)
+# Build with automatic layer caching (-f to specify alternate Dockerfile path)
 sudo ./build/pieces build . --tag my-service
 
-# Ephemeral, read-only, non-root run with microsecond startup timing
-sudo ./build/pieces run --rm --read-only --user 1000:1000 --run-as-non-root --timing my-service
+# Ephemeral, read-only, non-root run with tmpfs, env-file, and startup timing
+sudo ./build/pieces run --rm --read-only --run-as-non-root --tmpfs /tmp:size=32m --env-file .env --timing my-service
 
-# Detached background service with cgroup v2 caps, port publish, and log rotation
-sudo ./build/pieces run -d \
-  --name api \
-  --restart unless-stopped \
-  --memory 256m --cpus 1.0 --pids-max 64 \
-  -p 8080:80 \
-  my-service
+# Custom network + named volume + detached service
+sudo ./build/pieces volume create app-data
+sudo ./build/pieces network create app-net
+sudo ./build/pieces run -d --name api --net app-net -v app-data:/data -p 8080:8080 my-service
 
-# Inspect, view telemetry/logs, enter namespaces, stop, and clean up
-sudo ./build/pieces ps -a
+# Inspect, copy files, view telemetry/logs, enter namespaces, stop, and clean up
+sudo ./build/pieces inspect api
+sudo ./build/pieces cp api:/app/start.sh ./start.sh.bak
 sudo ./build/pieces stats api
-sudo ./build/pieces logs -n 20 api
 sudo ./build/pieces exec -it api /bin/sh
-sudo ./build/pieces stop api
-sudo ./build/pieces rm api
+sudo ./build/pieces stop api && sudo ./build/pieces rm api
+
+# Multi-container Compose workflow & optional Docker REST Unix socket
+sudo ./build/pieces compose up -d
+sudo ./build/pieces compose ps
+sudo ./build/pieces compose down
+sudo ./build/pieces serve --socket /run/pieces/docker.sock
 ```
 
 ---
@@ -114,10 +126,11 @@ Pieces avoids interpreter startup, full-tree copies, and network helper subproce
 | **CLI & Dispatch** | Native compiled C++20 binary (`-O3` in Release) | ~141 ms Python interpreter boot |
 | **`--read-only` Rootfs** | `readonly-bind`: pivots directly onto the immutable image dir (`MS_RDONLY`) | Zero directory creation, zero file copies |
 | **Writable Rootfs (`!readonly_rootfs`)** | `in-ns-overlay`: creates empty `upper`/`work`/`rootfs` (in `/dev/shm/.pieces-run/` RAM `tmpfs` for `--rm`) and mounts kernel `overlay` / `userxattr` / `fuse-overlayfs` inside `pid2`, or fast hybrid `tmpfs` + RO bind-mounts (`--full-copy` optional) | Eliminates ~543 ms full-image copy and ~304 ms recursive cleanup |
-| **Networking & IPAM** | Direct `NETLINK_ROUTE` sockets for `pieces-br0`, `veth`, IP, and default route; sysfs + `/run/pieces/.net_ready_*` fast skip; `flock`-locked `.ipam_leases.json` (`O(active)`) | Eliminates `ip` / `nsenter` subprocess spawns and exited-container directory scans |
+| **Build Layer Cache** | Content-addressed `.pieces/cache/layers/<chain_hash>` snapshots | Skips re-running unchanged `COPY`/`RUN` stages on rebuild |
+| **Networking & IPAM** | Direct `NETLINK_ROUTE` sockets for bridge/`veth`/IP/route; sysfs + `/run/pieces/.net_ready_*` fast skip; `flock`-locked per-network IPAM (`O(active)`) | Eliminates `ip` / `nsenter` subprocess spawns and exited-container directory scans |
 | **Security & Pipes** | Seccomp BPF & target `cap_value_t` computed once before `fork()`; rootful runs skip `userns_done_pipe` | Removes per-spawn compilation and extra parent/child pipe round-trips |
 
-### Measured Timings (Observed in Sandbox)
+### Measured Timings (Observed in Sandbox Pre-Docker-Parity Benchmark Run)
 
 | Command / Benchmark | Observed Timing | Breakdown / Notes |
 | --- | --- | --- |
@@ -161,13 +174,13 @@ Supported `config.json` features include `linux.namespaces` path joining (`setns
 Docker Hub (`docker.io`, `registry-1.docker.io`, `index.docker.io`, `registry.hub.docker.com`) is disabled by design. Use:
 1. **Built-in upstream Linux distro rootfs CDNs:** `alpine:3.18`, `fedora:38`, `ubuntu:22.04`
 2. **Direct tarballs (`FROM_URL` + optional `SHA256`):** Any `http://` or `https://` `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, or `.tar.bz2`
-3. **Explicit non-Docker-Hub OCI registries:** `ghcr.io/...`, `quay.io/...`, `registry.fedoraproject.org/...`, `localhost:5000/...` (`pieces pull <ref>`)
+3. **Explicit non-Docker-Hub OCI registries:** `ghcr.io/...`, `quay.io/...`, `registry.fedoraproject.org/...`, `localhost:5000/...` (`pieces login` + `pieces pull <ref>`)
 
 ---
 
 ## Host Verification
 
-After building on a Linux host with namespaces and `sudo` available, run the full 8-step live kernel integration suite (build with `RUN`, `--read-only` + `--user` + `seccomp` test, `-d` + `-p` + cgroups v2 limits, `ps`/`stats`/`logs`, `exec`, `stop`/`rm`, full OCI lifecycle, and cleanup):
+After building on a Linux host with namespaces and `sudo` available, run the full 8-step live kernel integration suite:
 
 ```bash
 sudo ./scripts/verify_host.sh ./build/pieces
@@ -177,4 +190,4 @@ sudo ./scripts/verify_host.sh ./build/pieces
 
 ## Complete Documentation
 
-See **[TUTORIAL.md](TUTORIAL.md)** for **The Pieces Book: Complete Architecture, Internals & Operations Guide**—covering every C++ file, syscall, `Piecefile` rule, Netlink message, seccomp BPF instruction, OCI state transition, benchmark methodology, CLI flag, JSON schema, and integration recipe.
+See **[TUTORIAL.md](TUTORIAL.md)** for **The Pieces Book: Complete Architecture, Kernel Internals & Operations Guide**—covering every C++ file, syscall, `Piecefile`/`Dockerfile` rule, multi-stage layer cache, Netlink message, custom network & DNS, Compose orchestration, REST Unix socket API, seccomp BPF instruction, OCI state transition, benchmark methodology, CLI flag, JSON schema, and integration recipe.

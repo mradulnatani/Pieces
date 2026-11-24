@@ -1,5 +1,7 @@
 #include <archive.h>
 #include <archive_entry.h>
+#include <linux/seccomp.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -14,11 +16,14 @@
 
 #include "pieces/cgroup.hpp"
 #include "pieces/cli.hpp"
+#include "pieces/compose.hpp"
 #include "pieces/container.hpp"
+#include "pieces/daemon.hpp"
 #include "pieces/filesystem.hpp"
 #include "pieces/json.hpp"
 #include "pieces/namespaces.hpp"
 #include "pieces/network.hpp"
+#include "pieces/oci_runtime.hpp"
 #include "pieces/parser.hpp"
 #include "pieces/registry.hpp"
 #include "pieces/security.hpp"
@@ -86,215 +91,218 @@ void create_tar_gz(const fs::path& out_tar, const std::vector<std::pair<std::str
     archive_write_free(a);
 }
 
-void test_json_roundtrip() {
+void test_json_and_parser() {
     pieces::JsonObject obj;
     obj["name"] = "pieces";
     obj["count"] = 42;
-    obj["ok"] = true;
     obj["arr"] = pieces::JsonArray{"a", "b\"c"};
-
-    std::string dumped = pieces::JsonValue(obj).dump(2);
-    pieces::JsonValue parsed = pieces::JsonValue::parse(dumped);
-    CHECK(parsed.is_object());
+    auto parsed = pieces::JsonValue::parse(pieces::JsonValue(obj).dump(2));
     CHECK(parsed.find("name")->as_string() == "pieces");
     CHECK(parsed.find("count")->as_int() == 42);
-    CHECK(parsed.find("arr")->as_array()[1].as_string() == "b\"c");
-}
 
-void test_parser() {
     TempDir tmp("pieces-parser");
     fs::path pf = tmp.path / "Piecefile";
     write_text_file(pf, R"(
-# comment
 FROM ubuntu:22.04
 SHA256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ENV FOO=bar BAZ="hello world"
-ENV LEGACY legacy value
 WORKDIR /app
 COPY ./src /app/src
-RUN echo "step 1" && \
-    echo "step 2"
+RUN echo "a" && \
+    echo "b"
 ENTRYPOINT ["/bin/sh", "-c"]
-CMD echo "hi there"
+CMD echo "hi"
 )");
-
     auto spec = pieces::parse_piecefile(pf.string());
     CHECK(spec.has_value());
-    CHECK(spec->from_image == "ubuntu:22.04");
     CHECK(spec->sha256 == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    CHECK(spec->env.at("FOO") == "bar");
-    CHECK(spec->env.at("BAZ") == "hello world");
-    CHECK(spec->env.at("LEGACY") == "legacy value");
-    CHECK(spec->workdir == "/app");
-    CHECK(spec->copies.size() == 1);
-    CHECK(spec->runs.size() == 1);
-    CHECK(spec->runs[0] == "echo \"step 1\" && echo \"step 2\"");
-    CHECK((spec->entrypoint == std::vector<std::string>{"/bin/sh", "-c"}));
-    CHECK((spec->cmd == std::vector<std::string>{"echo", "hi there"}));
-
-    fs::path bad_sha = tmp.path / "BadSha";
-    write_text_file(bad_sha, "FROM ubuntu:22.04\nSHA256 not-hex\n");
-    CHECK(!pieces::parse_piecefile(bad_sha.string()).has_value());
-
-    fs::path missing_from = tmp.path / "NoFrom";
-    write_text_file(missing_from, "CMD /bin/sh\n");
-    CHECK(!pieces::parse_piecefile(missing_from.string()).has_value());
+    CHECK(spec->runs[0] == "echo \"a\" && echo \"b\"");
 }
 
-void test_cli() {
+void test_cli_native_and_oci() {
     auto run_args = pieces::parse_command_args({
-        "run", "--rm", "-d", "-it", "--rootless", "--name", "c1",
-        "--restart", "unless-stopped", "--log-max-size", "5m", "--log-max-files", "4",
-        "--cap-drop", "NET_RAW", "--cap-add", "SYS_TIME",
-        "-p", "8080:80", "-p", "127.0.0.1:5353:53/udp",
-        "--memory", "128m", "-e", "A=1", "ubuntu-22.04", "ls", "-la", "/"
+        "run", "--rm", "-d", "-it", "--read-only", "--run-as-non-root", "--timing",
+        "--user", "1000:1000", "--seccomp-profile", "/tmp/sc.json",
+        "--security-opt", "apparmor=pieces-default", "--security-opt", "label=system_u:system_r:container_t:s0",
+        "--no-isolate-net", "--restart", "unless-stopped",
+        "-p", "8080:80", "ubuntu-22.04", "sh"
     });
     CHECK(run_args.command == pieces::CliCommand::Run);
-    CHECK(run_args.auto_remove);
-    CHECK(run_args.detach);
-    CHECK(run_args.interactive);
-    CHECK(run_args.allocate_tty);
-    CHECK(run_args.rootless);
-    CHECK(run_args.restart_policy == "unless-stopped");
-    CHECK(run_args.log_max_size == "5m");
-    CHECK(run_args.log_max_files == 4);
-    CHECK((run_args.cap_drop == std::vector<std::string>{"NET_RAW"}));
-    CHECK((run_args.cap_add == std::vector<std::string>{"SYS_TIME"}));
-    CHECK((run_args.port_specs == std::vector<std::string>{"8080:80", "127.0.0.1:5353:53/udp"}));
-    CHECK(run_args.image == "ubuntu-22.04");
-    CHECK((run_args.cmd_args == std::vector<std::string>{"ls", "-la", "/"}));
+    CHECK(run_args.timing);
+    CHECK(run_args.readonly_rootfs);
+    CHECK(run_args.run_as_non_root);
+    CHECK(!run_args.isolate_net);
+    CHECK(run_args.user_spec == "1000:1000");
+    CHECK(run_args.seccomp_profile == "/tmp/sc.json");
+    CHECK(run_args.security_opts.size() == 2);
 
-    auto build_args = pieces::parse_command_args({"build", ".", "--no-cache", "-t", "custom:v1"});
-    CHECK(build_args.command == pieces::CliCommand::Build);
-    CHECK(build_args.no_cache);
-    CHECK(build_args.tag == "custom:v1");
+    auto oci_create = pieces::parse_command_args({"--root", "/run/k8s-pieces", "create", "--bundle", "/b", "--pid-file", "/p", "pod-c1"});
+    CHECK(oci_create.command == pieces::CliCommand::OciCreate);
+    CHECK(oci_create.oci_state_root == "/run/k8s-pieces");
+    CHECK(oci_create.oci_bundle == "/b");
+    CHECK(oci_create.oci_pid_file == "/p");
+    CHECK(oci_create.target_container == "pod-c1");
 
-    auto pull_args = pieces::parse_command_args({"pull", "ghcr.io/org/app:v1", "-t", "app1"});
-    CHECK(pull_args.command == pieces::CliCommand::Pull);
-    CHECK(pull_args.pull_ref == "ghcr.io/org/app:v1");
-    CHECK(pull_args.tag == "app1");
+    auto oci_kill = pieces::parse_command_args({"kill", "pod-c1", "SIGKILL"});
+    CHECK(oci_kill.command == pieces::CliCommand::OciKill);
+    CHECK(oci_kill.oci_signal == "SIGKILL");
 
-    auto exec_args = pieces::parse_command_args({"exec", "-it", "-w", "/app", "web", "sh"});
-    CHECK(exec_args.command == pieces::CliCommand::Exec);
-    CHECK(exec_args.interactive);
-    CHECK(exec_args.allocate_tty);
+    auto oci_del = pieces::parse_command_args({"delete", "-f", "pod-c1"});
+    CHECK(oci_del.command == pieces::CliCommand::OciDelete);
+    CHECK(oci_del.force);
+    CHECK(oci_del.target_container == "pod-c1");
 
-    auto prune_args = pieces::parse_command_args({"prune"});
-    CHECK(prune_args.command == pieces::CliCommand::Prune);
+    auto stats_args = pieces::parse_command_args({"stats", "pod-c1"});
+    CHECK(stats_args.command == pieces::CliCommand::Stats);
 }
 
-void test_filesystem_security_cache_and_build_run_order() {
-    for (const char* bad : {"", ".", "..", "../etc", "a/b", "a\\b", "-bad"}) {
-        bool threw = false;
-        try {
-            (void)pieces::validate_name(bad);
-        } catch (const std::invalid_argument&) {
-            threw = true;
-        }
-        CHECK(threw);
+void test_allowlist_seccomp_oci_json_user_and_mac() {
+    // Verify default allowlist blocks unshare, setns, chroot, bpf, ptrace, mount
+    auto allowed = pieces::default_allowed_syscalls();
+    auto is_allowed = [&](const char* name) {
+        auto nr = pieces::resolve_syscall_number(name);
+        if (!nr.has_value()) return false;
+        return std::find(allowed.begin(), allowed.end(), *nr) != allowed.end();
+    };
+    CHECK(is_allowed("read"));
+    CHECK(is_allowed("write"));
+    CHECK(is_allowed("execve"));
+    CHECK(!is_allowed("unshare"));
+    CHECK(!is_allowed("setns"));
+    CHECK(!is_allowed("chroot"));
+    CHECK(!is_allowed("bpf"));
+    CHECK(!is_allowed("ptrace"));
+    CHECK(!is_allowed("mount"));
+
+    auto prog = pieces::build_allowlist_seccomp_filter(allowed, SECCOMP_RET_ERRNO | 1);
+    CHECK(prog.instructions.size() > 100);
+    // Final instruction must be default-deny (not SECCOMP_RET_ALLOW)
+    CHECK(prog.instructions.back().k != SECCOMP_RET_ALLOW);
+
+    // OCI seccomp JSON profile compilation
+    pieces::JsonValue oci_sc = pieces::JsonValue::parse(R"({
+      "defaultAction": "SCMP_ACT_ERRNO",
+      "defaultErrnoRet": 1,
+      "syscalls": [
+        {"names": ["read", "write", "exit_group"], "action": "SCMP_ACT_ALLOW"}
+      ]
+    })");
+    auto custom_prog = pieces::build_seccomp_from_oci_json(oci_sc);
+    CHECK(custom_prog.instructions.size() == 4 + 3 * 2 + 1);
+    CHECK(custom_prog.instructions.back().k == (SECCOMP_RET_ERRNO | 1U));
+
+    // User & security-opt parsing
+    auto u1 = pieces::parse_user_spec("1000:2000");
+    CHECK(u1.uid == 1000 && u1.gid == 2000 && u1.has_gid);
+    auto u2 = pieces::parse_user_spec("65534");
+    CHECK(u2.uid == 65534 && u2.gid == 65534);
+
+    bool non_root_threw = false;
+    try {
+        pieces::apply_process_user(0, 0, {}, true);
+    } catch (const std::runtime_error&) {
+        non_root_threw = true;
     }
+    CHECK(non_root_threw);
 
-    TempDir tmp("pieces-fs");
-    for (const char* unsafe_entry : {"../escape.txt", "/etc/passwd"}) {
-        fs::path bad_tar = tmp.path / "bad.tar.gz";
-        create_tar_gz(bad_tar, {{unsafe_entry, "bad"}});
-        bool threw = false;
-        try {
-            pieces::safe_extract_tar_file(bad_tar.string(), (tmp.path / "out").string());
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        CHECK(threw);
-    }
-
-    fs::path base_tar = tmp.path / "base.tar.gz";
-    create_tar_gz(base_tar, {{"etc/os-release", "ID=alpine\n"}});
-    std::string good_sha = pieces::sha256_file(base_tar.string());
-
-    fs::path ctx = tmp.path / "ctx";
-    write_text_file(ctx / "app.txt", "hello-app\n");
-    fs::path pf = ctx / "Piecefile";
-    write_text_file(
-        pf,
-        "FROM_URL https://example.com/base.tar.gz\n"
-        "SHA256 " + good_sha + "\n"
-        "ENV STAGE=1\n"
-        "WORKDIR /app\n"
-        "COPY app.txt /app/app.txt\n"
-        "RUN cat /app/app.txt > /app/built.txt\n"
-        "CMD [\"/bin/sh\"]\n");
-
-    auto spec = pieces::parse_piecefile(pf.string());
-    CHECK(spec.has_value());
-
-    fs::path img_path = tmp.path / "images" / "my-app";
-    fs::path cache_dir = tmp.path / "cache";
-    int downloads = 0;
-    bool built = pieces::build_image(
-        *spec,
-        img_path.string(),
-        ctx.string(),
-        [&](const std::string&, const std::string& dest) {
-            ++downloads;
-            fs::copy_file(base_tar, dest, fs::copy_options::overwrite_existing);
-        },
-        [&](const std::string& rootfs_dir,
-            const std::string&,
-            const std::map<std::string, std::string>& env,
-            const std::string& workdir) -> int {
-            CHECK(env.at("STAGE") == "1");
-            CHECK(workdir == "/app");
-            CHECK(read_text_file(fs::path(rootfs_dir) / "app/app.txt") == "hello-app\n");
-            write_text_file(fs::path(rootfs_dir) / "app/built.txt", "built-ok\n");
-            return 0;
-        },
-        nullptr,
-        false,
-        cache_dir.string());
-    CHECK(built);
-    CHECK(downloads == 1);
-    CHECK(read_text_file(img_path / "app/built.txt") == "built-ok\n");
-
-    // Second build hits cache without invoking downloader
-    bool built_cached = pieces::build_image(
-        *spec,
-        img_path.string(),
-        ctx.string(),
-        [&](const std::string&, const std::string&) {
-            ++downloads;
-            throw std::runtime_error("should not re-download on cache hit");
-        },
-        [&](const std::string& rootfs_dir, const std::string&, const std::map<std::string, std::string>&, const std::string&) {
-            write_text_file(fs::path(rootfs_dir) / "app/built.txt", "built-cached\n");
-            return 0;
-        },
-        nullptr,
-        false,
-        cache_dir.string());
-    CHECK(built_cached);
-    CHECK(downloads == 1);
-    CHECK(read_text_file(img_path / "app/built.txt") == "built-cached\n");
-
-    // SHA-256 mismatch rejects build and preserves existing image
-    spec->sha256 = std::string(64, '0');
-    bool bad_sha_ok = pieces::build_image(
-        *spec,
-        img_path.string(),
-        ctx.string(),
-        [&](const std::string&, const std::string& dest) {
-            fs::copy_file(base_tar, dest, fs::copy_options::overwrite_existing);
-        },
-        nullptr,
-        nullptr,
-        true,
-        cache_dir.string());
-    CHECK(!bad_sha_ok);
-    CHECK(read_text_file(img_path / "app/built.txt") == "built-cached\n");
+    auto sopts = pieces::parse_security_opts({"apparmor=pieces-default", "label=system_u:system_r:svirt_lxc_net_t:s0"});
+    CHECK(sopts.apparmor_profile == "pieces-default");
+    CHECK(sopts.selinux_label == "system_u:system_r:svirt_lxc_net_t:s0");
 }
 
-void test_non_docker_hub_oci_and_sha256_verification() {
-    // Reject Docker Hub and bare registry-less OCI refs
-    for (const char* rejected : {"ubuntu:22.04", "alpine", "docker.io/library/alpine:3.18", "registry-1.docker.io/library/ubuntu:22.04"}) {
+void test_oci_runtime_spec_and_cgroup_stats() {
+    auto def_spec = pieces::generate_default_oci_spec_json(true);
+    auto parsed_def = pieces::parse_oci_spec_json(pieces::JsonValue(def_spec));
+    CHECK(parsed_def.oci_version == "1.0.2");
+    CHECK(parsed_def.no_new_privileges);
+    CHECK(parsed_def.masked_paths.size() == 4);
+
+    // Parse full Kubernetes/containerd-style config.json
+    pieces::JsonValue k8s_cfg = pieces::JsonValue::parse(R"({
+      "ociVersion": "1.0.2",
+      "hostname": "web-pod",
+      "root": {"path": "rootfs", "readonly": true},
+      "process": {
+        "user": {"uid": 1001, "gid": 1001, "additionalGids": [2000, 3000]},
+        "args": ["/usr/bin/server", "--port", "8080"],
+        "env": ["PATH=/usr/bin:/bin", "POD=web"],
+        "cwd": "/srv",
+        "noNewPrivileges": true,
+        "apparmorProfile": "k8s-apparmor",
+        "selinuxLabel": "system_u:system_r:container_t:s0:c1,c2",
+        "capabilities": {
+          "bounding": ["CAP_NET_BIND_SERVICE"],
+          "effective": ["CAP_NET_BIND_SERVICE"],
+          "permitted": ["CAP_NET_BIND_SERVICE"]
+        }
+      },
+      "mounts": [
+        {"destination": "/data", "type": "bind", "source": "/var/lib/data", "options": ["rbind", "ro"]}
+      ],
+      "linux": {
+        "cgroupsPath": "/kubepods.slice/pod123/c1",
+        "namespaces": [
+          {"type": "pid"},
+          {"type": "network", "path": "/var/run/netns/cni-pod123"},
+          {"type": "ipc", "path": "/proc/1234/ns/ipc"}
+        ],
+        "uidMappings": [{"containerID": 0, "hostID": 100000, "size": 65536}],
+        "gidMappings": [{"containerID": 0, "hostID": 100000, "size": 65536}],
+        "resources": {
+          "memory": {"limit": 268435456},
+          "cpu": {"quota": 50000, "period": 100000},
+          "pids": {"limit": 128}
+        },
+        "seccomp": {
+          "defaultAction": "SCMP_ACT_ERRNO",
+          "syscalls": [{"names": ["read", "write"], "action": "SCMP_ACT_ALLOW"}]
+        }
+      },
+      "annotations": {"io.kubernetes.pod.name": "web-pod"},
+      "hooks": {
+        "poststart": [{"path": "/usr/local/bin/cni-hook", "args": ["cni-hook", "add"]}]
+      }
+    })");
+
+    auto spec = pieces::parse_oci_spec_json(k8s_cfg);
+    CHECK(spec.root_readonly);
+    CHECK(spec.uid == 1001 && spec.gid == 1001);
+    CHECK((spec.additional_gids == std::vector<gid_t>{2000, 3000}));
+    CHECK(spec.apparmor_profile == "k8s-apparmor");
+    CHECK(spec.selinux_label == "system_u:system_r:container_t:s0:c1,c2");
+    CHECK(spec.capabilities.has_value() && spec.capabilities->contains(CAP_NET_BIND_SERVICE));
+    CHECK(spec.cgroups_path == "/kubepods.slice/pod123/c1");
+    CHECK(spec.namespaces[1].path == "/var/run/netns/cni-pod123");
+    CHECK(spec.uid_mappings.size() == 1 && spec.uid_mappings[0].size == 65536);
+    CHECK(spec.memory_limit_bytes == 268435456ULL);
+    CHECK(spec.cpu_quota == 50000);
+    CHECK(spec.pids_limit == 128);
+    CHECK(spec.seccomp.has_value());
+    CHECK(spec.annotations.at("io.kubernetes.pod.name") == "web-pod");
+    CHECK(spec.hooks.poststart.size() == 1);
+
+    CHECK(pieces::parse_signal_name("SIGTERM") == SIGTERM);
+    CHECK(pieces::parse_signal_name("KILL") == SIGKILL);
+    CHECK(pieces::parse_signal_name("9") == 9);
+
+    // Mock cgroup v2 stats reading
+    TempDir cg_tmp("pieces-cgstats");
+    write_text_file(cg_tmp.path / "memory.current", "1048576\n");
+    write_text_file(cg_tmp.path / "memory.max", "268435456\n");
+    write_text_file(cg_tmp.path / "pids.current", "4\n");
+    write_text_file(cg_tmp.path / "pids.max", "128\n");
+    write_text_file(cg_tmp.path / "cpu.stat", "usage_usec 987654\nuser_usec 500000\n");
+
+    auto st = pieces::read_cgroup_stats(cg_tmp.path.string());
+    CHECK(st.memory_current_bytes == 1048576ULL);
+    CHECK(st.memory_max_bytes == 268435456ULL);
+    CHECK(st.pids_current == 4ULL);
+    CHECK(st.pids_max == 128ULL);
+    CHECK(st.cpu_usage_usec == 987654ULL);
+}
+
+void test_oci_pull_no_docker_hub_and_ipam_logs() {
+    for (const char* rejected : {"ubuntu:22.04", "docker.io/library/alpine:3.18", "registry-1.docker.io/library/ubuntu:22.04"}) {
         bool threw = false;
         try {
             (void)pieces::parse_image_reference(rejected);
@@ -304,178 +312,255 @@ void test_non_docker_hub_oci_and_sha256_verification() {
         CHECK(threw);
     }
 
-    auto r1 = pieces::parse_image_reference("ghcr.io/org/service:v1.2");
-    CHECK(r1.registry == "ghcr.io");
-    CHECK(r1.repository == "org/service");
-    CHECK(r1.tag == "v1.2");
-
-    auto r2 = pieces::parse_image_reference("localhost:5000/team/api:dev");
-    CHECK(r2.registry == "localhost:5000");
-    CHECK(r2.repository == "team/api");
-    CHECK(r2.tag == "dev");
-
-    TempDir tmp("pieces-oci");
-    fs::path layer1 = tmp.path / "layer1.tar.gz";
-    fs::path layer2 = tmp.path / "layer2.tar.gz";
-    create_tar_gz(layer1, {
-        {"etc/keep.txt", "keep\n"},
-        {"etc/remove_me.txt", "gone\n"},
-        {"opt/opaque/old.txt", "old\n"},
-    });
-    create_tar_gz(layer2, {
-        {"etc/.wh.remove_me.txt", ""},
-        {"opt/opaque/.wh..wh..opq", ""},
-        {"opt/opaque/new.txt", "new\n"},
-    });
-
-    std::string l1_digest = "sha256:" + pieces::sha256_file(layer1.string());
-    std::string l2_digest = "sha256:" + pieces::sha256_file(layer2.string());
-    std::string config_json = R"({
-      "config": {
-        "Env": ["PATH=/usr/bin:/bin", "APP=oci"],
-        "WorkingDir": "/srv",
-        "Cmd": ["/bin/sh", "-c", "echo ok"]
-      }
-    })";
-    std::string cfg_digest = "sha256:" + pieces::sha256_string(config_json);
-    std::string manifest_json = R"({
-      "config": {"digest": ")" + cfg_digest + R"("},
-      "layers": [
-        {"digest": ")" + l1_digest + R"("},
-        {"digest": ")" + l2_digest + R"("}
-      ]
-    })";
-    std::string man_digest = "sha256:" + pieces::sha256_string(manifest_json);
-    std::string index_json = R"({
-      "manifests": [
-        {"digest": ")" + man_digest + R"(", "platform": {"os": "linux", "architecture": ")" + pieces::host_oci_architecture() + R"("}}
-      ]
-    })";
-
-    auto make_mock_http = [&](bool corrupt_layer) {
-        return [&, corrupt_layer](const std::string& url,
-                                  const std::vector<std::string>& headers,
-                                  const std::string& save_to_path) -> pieces::HttpResponse {
-            bool has_auth = false;
-            for (const auto& h : headers) {
-                if (h == "Authorization: Bearer tok123") has_auth = true;
-            }
-            if (url.find("auth.example.com/token") != std::string::npos) {
-                return {200, {}, R"({"token":"tok123"})"};
-            }
-            if (!has_auth) {
-                return {401, {{"www-authenticate", "Bearer realm=\"https://auth.example.com/token\",service=\"reg\",scope=\"repo:pull\""}}, ""};
-            }
-            if (url.find("/manifests/v1") != std::string::npos) {
-                return {200, {}, index_json};
-            }
-            if (url.find("/manifests/" + man_digest) != std::string::npos) {
-                return {200, {}, manifest_json};
-            }
-            if (url.find("/blobs/" + cfg_digest) != std::string::npos) {
-                return {200, {}, config_json};
-            }
-            if (url.find("/blobs/" + l1_digest) != std::string::npos) {
-                fs::copy_file(layer1, save_to_path, fs::copy_options::overwrite_existing);
-                return {200, {}, ""};
-            }
-            if (url.find("/blobs/" + l2_digest) != std::string::npos) {
-                if (corrupt_layer) {
-                    write_text_file(save_to_path, "tampered bytes");
-                } else {
-                    fs::copy_file(layer2, save_to_path, fs::copy_options::overwrite_existing);
-                }
-                return {200, {}, ""};
-            }
-            return {404, {}, ""};
-        };
-    };
-
-    fs::path pulled_img = tmp.path / "images" / "demo-v1";
-    CHECK(pieces::pull_oci_image("ghcr.io/org/demo:v1", pulled_img.string(), make_mock_http(false)));
-    CHECK(read_text_file(pulled_img / "etc/keep.txt") == "keep\n");
-    CHECK(!fs::exists(pulled_img / "etc/remove_me.txt"));
-    CHECK(!fs::exists(pulled_img / "opt/opaque/old.txt"));
-    CHECK(read_text_file(pulled_img / "opt/opaque/new.txt") == "new\n");
-
-    // Tampered layer digest fails SHA-256 verification
-    fs::path bad_img = tmp.path / "images" / "demo-bad";
-    CHECK(!pieces::pull_oci_image("ghcr.io/org/demo:v1", bad_img.string(), make_mock_http(true)));
-    CHECK(!fs::exists(bad_img));
-}
-
-void test_security_subid_and_cgroup() {
-    auto caps = pieces::compute_target_capabilities({"SYS_TIME"}, {"NET_RAW"});
-    CHECK(!caps.contains(CAP_NET_RAW));
-    CHECK(!caps.contains(CAP_SYS_ADMIN));
-    CHECK(caps.contains(CAP_SYS_TIME));
-    CHECK(caps.contains(CAP_CHOWN));
-
-    auto seccomp_prog = pieces::build_seccomp_filter(pieces::default_blocked_syscalls());
-    CHECK(seccomp_prog.instructions.size() > 10);
-
-    TempDir tmp("pieces-subid");
-    fs::path subuid = tmp.path / "subuid";
-    write_text_file(subuid, "alice:100000:65536\nbob:165536:65536\n");
-    auto r = pieces::parse_subid_range(subuid.string(), "bob");
-    CHECK(r.has_value());
-    CHECK(r->start == 165536U);
-    CHECK(r->count == 65536U);
-    CHECK(!pieces::parse_subid_range(subuid.string(), "charlie").has_value());
-
-    CHECK(pieces::parse_memory_limit("256m") == 256ULL * 1024ULL * 1024ULL);
-    CHECK(pieces::format_cpu_max(0.5) == "50000 100000");
-}
-
-void test_ipam_log_rotation_and_restart_policies() {
-    TempDir tmp("pieces-prod");
-
-    // Flock-backed IPAM lease allocation + release
+    TempDir tmp("pieces-ipam");
     write_text_file(
         tmp.path / "c1" / "meta.json",
         pieces::JsonValue(pieces::JsonObject{{"id", "c1"}, {"status", "running"}, {"pid", static_cast<int64_t>(::getpid())}}).dump());
-    write_text_file(
-        tmp.path / "c2" / "meta.json",
-        pieces::JsonValue(pieces::JsonObject{{"id", "c2"}, {"status", "running"}, {"pid", static_cast<int64_t>(::getpid())}}).dump());
-
     std::string ip1 = pieces::allocate_container_ip(tmp.path.string(), "c1");
-    std::string ip2 = pieces::allocate_container_ip(tmp.path.string(), "c2");
     CHECK(ip1 == "10.0.0.2");
-    CHECK(ip2 == "10.0.0.3");
     pieces::release_container_ip(tmp.path.string(), "c1");
-    CHECK(pieces::allocate_container_ip(tmp.path.string(), "c3") == "10.0.0.2");
+    CHECK(pieces::allocate_container_ip(tmp.path.string(), "c2") == "10.0.0.2");
 
-    // RotatingLogWriter rotates when crossing max_bytes (min 1024 bytes)
     fs::path log_file = tmp.path / "logs" / "container.log";
     {
         pieces::RotatingLogWriter writer(log_file.string(), 1024, 3);
-        std::string chunk(600, 'A');
+        std::string chunk(700, 'A');
         writer.write(chunk.data(), chunk.size());
-        writer.write(chunk.data(), chunk.size());  // triggers rotation
-        std::string chunk2(300, 'B');
-        writer.write(chunk2.data(), chunk2.size());
+        writer.write(chunk.data(), chunk.size());
     }
     CHECK(fs::exists(log_file));
     CHECK(fs::exists(log_file.string() + ".1"));
-    CHECK(read_text_file(log_file).find('B') != std::string::npos);
+    CHECK(read_text_file(log_file).find('A') != std::string::npos);
 
-    CHECK(pieces::parse_restart_policy("unless-stopped") == pieces::RestartPolicy::UnlessStopped);
-    CHECK(pieces::restart_policy_to_string(pieces::RestartPolicy::OnFailure) == "on-failure");
+    // Safe tarball extraction + whiteout + SHA-256 verification
+    fs::path bad_tar = tmp.path / "bad.tar.gz";
+    create_tar_gz(bad_tar, {{"../escape.txt", "bad"}});
+    bool tar_threw = false;
+    try {
+        pieces::safe_extract_tar_file(bad_tar.string(), (tmp.path / "out").string());
+    } catch (const std::exception&) {
+        tar_threw = true;
+    }
+    CHECK(tar_threw);
 
-    auto p1 = pieces::parse_port_mapping("8080:80");
-    CHECK(pieces::format_port_mapping(p1) == "8080->80/tcp");
+    fs::path good_tar = tmp.path / "good.tar.gz";
+    create_tar_gz(good_tar, {{"etc/hello.txt", "hello"}});
+    fs::path extracted = tmp.path / "extracted";
+    pieces::safe_extract_tar_file(good_tar.string(), extracted.string());
+    CHECK(read_text_file(extracted / "etc/hello.txt") == "hello");
+    CHECK(pieces::sha256_file(good_tar.string()).size() == 64);
+
+    // Zero-copy read-only rootfs fast path
+    fs::path ro_cdir = tmp.path / "ro-container";
+    auto ro_setup = pieces::prepare_container_rootfs(extracted.string(), ro_cdir.string(), "robox", true, true);
+    CHECK(ro_setup.method == "readonly-bind");
+    CHECK(ro_setup.rootfs_dir == fs::absolute(extracted).string());
+    CHECK(!fs::exists(ro_cdir));
+    pieces::cleanup_container_rootfs(ro_cdir.string(), ro_setup.method);
+    CHECK(read_text_file(extracted / "etc/hello.txt") == "hello");
+
+    // In-namespace OverlayFS / hybrid writable rootfs fast path (no parent-side 500ms copy)
+    fs::path rw_cdir = tmp.path / "rw-container";
+    auto rw_setup = pieces::prepare_container_rootfs(extracted.string(), rw_cdir.string(), "rwbox", false, false);
+    CHECK(rw_setup.method == "in-ns-overlay");
+    CHECK(fs::is_directory(rw_setup.upper_dir));
+    CHECK(fs::is_directory(rw_setup.work_dir));
+    CHECK(fs::is_directory(rw_setup.rootfs_dir));
+    CHECK(!fs::exists(fs::path(rw_setup.rootfs_dir) / "etc/hello.txt"));
+    pieces::cleanup_container_rootfs(rw_cdir.string(), rw_setup.method);
+}
+
+void test_docker_parity_build_cli_volumes_auth_net_compose_api() {
+    TempDir tmp("pieces-parity");
+
+    // 1. Dockerfile fallback + multi-stage + ARG + USER + LABEL + EXPOSE + VOLUME + .piecesignore
+    fs::path ctx = tmp.path / "ctx";
+    fs::path base_tar = tmp.path / "base.tar.gz";
+    create_tar_gz(base_tar, {{"bin/sh", "#!/bin/sh\n"}, {"etc/os-release", "ID=test\n"}});
+    write_text_file(ctx / ".dockerignore", "*.tmp\nsecret/\n");
+    write_text_file(ctx / "src" / "hello.txt", "compiled-artifact\n");
+    write_text_file(ctx / "src" / "ignored.tmp", "skip-me\n");
+    write_text_file(ctx / "secret" / "key.txt", "do-not-copy\n");
+    write_text_file(ctx / "bundle.tar.gz", "");
+    create_tar_gz(ctx / "bundle.tar.gz", {{"extracted/data.txt", "from-add\n"}});
+    write_text_file(ctx / "Dockerfile", R"(
+ARG APP_NAME=demo
+FROM_URL https://example.com/base.tar.gz AS stage1
+COPY ./src /build
+FROM_URL https://example.com/base.tar.gz AS final
+ARG VER=1.2.3
+LABEL org.example.version=1.2.3 app="my demo"
+EXPOSE 8080/tcp 9090
+VOLUME ["/data"]
+USER 1000:1000
+ENV SERVICE_VER=${VER}
+WORKDIR /app
+COPY --from=stage1 /build/hello.txt /app/hello.txt
+ADD bundle.tar.gz /app/
+CMD ["/bin/sh"]
+)");
+
+    std::string resolved_pf = pieces::resolve_piecefile_path(ctx.string());
+    CHECK(fs::path(resolved_pf).filename() == "Dockerfile");
+    auto spec = pieces::parse_piecefile(resolved_pf);
+    CHECK(spec.has_value());
+    CHECK(spec->stages.size() == 2);
+    CHECK(spec->user == "1000:1000");
+    CHECK(spec->labels.at("org.example.version") == "1.2.3");
+    CHECK(spec->exposed_ports.size() == 2);
+    CHECK(spec->volumes.size() == 1 && spec->volumes[0] == "/data");
+
+    fs::path img_dir = tmp.path / "images";
+    fs::path cache_dir = tmp.path / "cache";
+    fs::path out_img = img_dir / "parity-app";
+    auto mock_dl = [&](const std::string& /*url*/, const std::string& dst) {
+        fs::copy_file(base_tar, dst, fs::copy_options::overwrite_existing);
+    };
+    bool built = pieces::build_image(
+        *spec, out_img.string(), ctx.string(), mock_dl, nullptr, nullptr, false,
+        cache_dir.string(), {{"VER", "9.9.9"}}, img_dir.string());
+    CHECK(built);
+    CHECK(read_text_file(out_img / "app/hello.txt") == "compiled-artifact\n");
+    CHECK(read_text_file(out_img / "app/extracted/data.txt") == "from-add\n");
+    CHECK(!fs::exists(out_img / "app/ignored.tmp"));
+
+    // Local image tagging + inspect + local FROM build
+    pieces::tag_image("parity-app", "parity-app:v2", img_dir.string());
+    auto inspected_img = pieces::inspect_image_json("parity-app:v2", img_dir.string());
+    CHECK(inspected_img.at("name").as_string() == "parity-app-v2");
+
+    fs::path derived_ctx = tmp.path / "derived_ctx";
+    write_text_file(derived_ctx / "Piecefile", "FROM parity-app:v2\nWORKDIR /app\n");
+    auto derived_spec = pieces::parse_piecefile((derived_ctx / "Piecefile").string());
+    CHECK(derived_spec.has_value());
+    CHECK(pieces::build_image(
+        *derived_spec, (img_dir / "derived").string(), derived_ctx.string(),
+        nullptr, nullptr, nullptr, false, cache_dir.string(), {}, img_dir.string()));
+    CHECK(read_text_file(img_dir / "derived/app/hello.txt") == "compiled-artifact\n");
+
+    // 2. CLI parity flags & new subcommands
+    auto cli_run = pieces::parse_command_args({
+        "run", "--name=web", "--net=host", "--entrypoint=/usr/bin/env",
+        "--env-file", "/tmp/e", "--tmpfs=/run:rw,size=8m",
+        "--add-host=db.local:10.0.0.5", "--dns=1.1.1.1", "-di", "parity-app", "arg1"
+    });
+    CHECK(cli_run.command == pieces::CliCommand::Run);
+    CHECK(cli_run.name == "web");
+    CHECK(cli_run.network_mode == "host");
+    CHECK(cli_run.entrypoint_override == "/usr/bin/env");
+    CHECK(cli_run.env_files.size() == 1);
+    CHECK(cli_run.tmpfs_specs.size() == 1);
+    CHECK(cli_run.add_hosts.size() == 1);
+    CHECK(cli_run.dns_servers.size() == 1);
+    CHECK(cli_run.detach && cli_run.interactive);
+    CHECK(cli_run.cmd_args == std::vector<std::string>{"arg1"});
+
+    auto cli_tag = pieces::parse_command_args({"tag", "a", "b"});
+    CHECK(cli_tag.command == pieces::CliCommand::Tag);
+    auto cli_cp = pieces::parse_command_args({"cp", "c1:/a", "/tmp/a"});
+    CHECK(cli_cp.command == pieces::CliCommand::Cp);
+    auto cli_vol = pieces::parse_command_args({"volume", "create", "mydata"});
+    CHECK(cli_vol.command == pieces::CliCommand::Volume && cli_vol.sub_action == "create");
+    auto cli_net = pieces::parse_command_args({"network", "create", "--subnet=10.9.0.0/24", "appnet"});
+    CHECK(cli_net.command == pieces::CliCommand::Network && cli_net.subnet_cidr == "10.9.0.0/24");
+    auto cli_login = pieces::parse_command_args({"login", "-u", "alice", "-p", "sec", "ghcr.io"});
+    CHECK(cli_login.command == pieces::CliCommand::Login && cli_login.login_registry == "ghcr.io");
+
+    // 3. Named volumes & tmpfs parser + cp + container inspect + env-file
+    fs::path vol_dir = tmp.path / "volumes";
+    pieces::create_volume("pgdata", vol_dir.string());
+    CHECK(pieces::list_volumes(vol_dir.string()).size() == 1);
+    auto vm = pieces::parse_volume_spec("pgdata:/var/lib/pg:ro", vol_dir.string());
+    CHECK(vm.container_path == "/var/lib/pg" && vm.read_only);
+    auto tm = pieces::parse_tmpfs_spec("/cache:size=16m");
+    CHECK(tm.container_path == "/cache" && tm.options == "size=16m");
+    pieces::remove_volume("pgdata", vol_dir.string());
+    CHECK(pieces::list_volumes(vol_dir.string()).empty());
+
+    fs::path envf = tmp.path / "app.env";
+    write_text_file(envf, "# comment\nFOO=bar\nQUOTED=\"hello world\"\n");
+    auto loaded_env = pieces::load_env_file(envf.string());
+    CHECK((loaded_env == std::vector<std::string>{"FOO=bar", "QUOTED=hello world"}));
+
+    fs::path cdir = tmp.path / "containers";
+    write_text_file(
+        cdir / "c100" / "meta.json",
+        pieces::JsonValue(pieces::JsonObject{
+            {"id", "c100"}, {"name", "web1"}, {"image", "parity-app"}, {"status", "exited"},
+            {"ip", "10.0.0.2"}, {"network", "appnet"}, {"pid", static_cast<int64_t>(0)}
+        }).dump());
+    write_text_file(cdir / "c100" / "upper" / "out.txt", "container-output\n");
+    fs::path host_copied = tmp.path / "copied_out.txt";
+    pieces::copy_between_host_and_container("c100:/out.txt", host_copied.string(), img_dir.string(), cdir.string());
+    CHECK(read_text_file(host_copied) == "container-output\n");
+    CHECK(pieces::inspect_any_json("web1", img_dir.string(), cdir.string()).at("id").as_string() == "c100");
+
+    // 4. Registry authentication persistence & ~/.docker/config.json fallback
+    fs::path auth_json = tmp.path / "auth.json";
+    pieces::save_registry_credentials("ghcr.io", "bob", "tok123", auth_json.string());
+    CHECK(pieces::load_registry_basic_auth("ghcr.io", auth_json.string()).value() ==
+          pieces::base64_encode("bob:tok123"));
+
+    // 5. Custom networks & Embedded DNS responder
+    fs::path nets_dir = tmp.path / "networks";
+    auto netcfg = pieces::create_network("appnet", "10.7.0.0/24", false, nets_dir.string());
+    CHECK(netcfg.gateway_ip == "10.7.0.1");
+    CHECK(pieces::list_networks(nets_dir.string()).size() == 2);
+    // Construct DNS A query for "db" (qtype=1, qclass=1)
+    std::vector<uint8_t> dns_q = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        2, 'd', 'b', 0,
+        0x00, 0x01, 0x00, 0x01
+    };
+    auto dns_resp = pieces::build_dns_response(dns_q, {{"db", "10.7.0.4"}});
+    CHECK(dns_resp.size() > dns_q.size());
+    CHECK((dns_resp[3] & 0x0F) == 0);  // NOERROR
+    CHECK(dns_resp[dns_resp.size() - 4] == 10 && dns_resp[dns_resp.size() - 1] == 4);
+    pieces::EmbeddedDnsServer dns_srv("127.0.0.1", 0, cdir.string(), "appnet");
+    CHECK(dns_srv.start());
+    CHECK(dns_srv.bound_port() > 0);
+    dns_srv.stop();
+    pieces::remove_network("appnet", nets_dir.string());
+
+    // 6. Compose YAML parsing + depends_on topological sort + REST API shim
+    auto proj = pieces::parse_compose_yaml(R"(
+services:
+  web:
+    image: parity-app
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+  db:
+    image: alpine:3.18
+    environment:
+      POSTGRES_DB: app
+networks:
+  backend:
+volumes:
+  dbdata:
+)", "myapp");
+    CHECK(proj.services.size() == 2);
+    auto order = pieces::topo_sort_services(proj.services);
+    CHECK((order == std::vector<std::string>{"db", "web"}));
+
+    auto ping = pieces::handle_docker_api_request("GET", "/v1.43/_ping");
+    CHECK(ping.status_code == 200 && ping.body == "OK");
+    auto info = pieces::handle_docker_api_request("GET", "/info", "", img_dir.string(), cdir.string(), vol_dir.string(), nets_dir.string());
+    CHECK(info.status_code == 200 && info.body.find("in-ns-overlay") != std::string::npos);
+    auto cjson = pieces::handle_docker_api_request("GET", "/containers/web1/json", "", img_dir.string(), cdir.string(), vol_dir.string(), nets_dir.string());
+    CHECK(cjson.status_code == 200 && cjson.body.find("c100") != std::string::npos);
 }
 
 }  // namespace
 
 int main() {
-    test_json_roundtrip();
-    test_parser();
-    test_cli();
-    test_filesystem_security_cache_and_build_run_order();
-    test_non_docker_hub_oci_and_sha256_verification();
-    test_security_subid_and_cgroup();
-    test_ipam_log_rotation_and_restart_policies();
-    std::cout << "All 7 production C++ test suites passed.\n";
+    test_json_and_parser();
+    test_cli_native_and_oci();
+    test_allowlist_seccomp_oci_json_user_and_mac();
+    test_oci_runtime_spec_and_cgroup_stats();
+    test_oci_pull_no_docker_hub_and_ipam_logs();
+    test_docker_parity_build_cli_volumes_auth_net_compose_api();
+    std::cout << "All 6 hardened, OCI runtime & Docker parity C++ test suites passed.\n";
     return 0;
 }

@@ -6,8 +6,11 @@
 #include <string>
 
 #include "pieces/cli.hpp"
+#include "pieces/compose.hpp"
 #include "pieces/container.hpp"
+#include "pieces/daemon.hpp"
 #include "pieces/filesystem.hpp"
+#include "pieces/network.hpp"
 #include "pieces/oci_runtime.hpp"
 #include "pieces/parser.hpp"
 #include "pieces/registry.hpp"
@@ -20,7 +23,7 @@ int handle_build(const pieces::CliArgs& args) {
     std::cout << "BUILD: Building from context directory: " << args.context << "\n";
     fs::create_directories(pieces::IMAGE_DIR);
 
-    std::string piecefile_path = (fs::path(args.context) / "Piecefile").string();
+    std::string piecefile_path = pieces::resolve_piecefile_path(args.context, args.build_file);
     auto spec = pieces::parse_piecefile(piecefile_path);
     if (!spec.has_value()) {
         std::cerr << "BUILD: Failed to parse Piecefile.\n";
@@ -38,7 +41,11 @@ int handle_build(const pieces::CliArgs& args) {
     }
 
     std::cout << "BUILD: Creating image '" << image_name << "'...\n";
-    return pieces::build_image(*spec, image_path, args.context, nullptr, nullptr, nullptr, args.no_cache) ? 0 : 1;
+    return pieces::build_image(
+               *spec, image_path, args.context, nullptr, nullptr, nullptr,
+               args.no_cache, pieces::CACHE_DIR, args.build_args, pieces::IMAGE_DIR)
+               ? 0
+               : 1;
 }
 
 int handle_pull(const pieces::CliArgs& args) {
@@ -84,10 +91,15 @@ int handle_run(const pieces::CliArgs& args) {
         cfg.network_mode = args.network_mode;
         cfg.user_spec = args.user_spec;
         cfg.seccomp_profile = args.seccomp_profile;
+        cfg.entrypoint_override = args.entrypoint_override;
         cfg.security_opts = args.security_opts;
         cfg.env_specs = args.env_specs;
+        cfg.env_files = args.env_files;
         cfg.volume_specs = args.volume_specs;
+        cfg.tmpfs_specs = args.tmpfs_specs;
         cfg.port_specs = args.port_specs;
+        cfg.add_hosts = args.add_hosts;
+        cfg.dns_servers = args.dns_servers;
         cfg.cap_add = args.cap_add;
         cfg.cap_drop = args.cap_drop;
         cfg.memory_limit = args.memory_limit;
@@ -180,6 +192,92 @@ int handle_ps(const pieces::CliArgs& args) {
     return 0;
 }
 
+int handle_volume(const pieces::CliArgs& args) {
+    if (args.sub_action == "create") {
+        if (args.extra_args.empty()) throw std::invalid_argument("volume create requires <name>");
+        pieces::create_volume(args.extra_args[0]);
+        std::cout << args.extra_args[0] << "\n";
+        return 0;
+    }
+    if (args.sub_action == "ls" || args.sub_action == "list") {
+        std::cout << std::left << std::setw(24) << "VOLUME NAME" << " MOUNTPOINT\n";
+        for (const auto& v : pieces::list_volumes()) {
+            std::cout << std::left << std::setw(24) << get_str(v, "name") << " " << get_str(v, "mountpoint") << "\n";
+        }
+        return 0;
+    }
+    if (args.sub_action == "inspect") {
+        if (args.extra_args.empty()) throw std::invalid_argument("volume inspect requires <name>");
+        std::cout << pieces::JsonValue(pieces::inspect_volume_json(args.extra_args[0])).dump(2) << "\n";
+        return 0;
+    }
+    if (args.sub_action == "rm") {
+        if (args.extra_args.empty()) throw std::invalid_argument("volume rm requires <name>");
+        for (const auto& v : args.extra_args) {
+            pieces::remove_volume(v);
+            std::cout << v << "\n";
+        }
+        return 0;
+    }
+    throw std::invalid_argument("Unknown volume subcommand: " + args.sub_action);
+}
+
+int handle_network(const pieces::CliArgs& args) {
+    if (args.sub_action == "create") {
+        if (args.extra_args.empty()) throw std::invalid_argument("network create requires <name>");
+        auto cfg = pieces::create_network(args.extra_args[0], args.subnet_cidr, false);
+        std::cout << cfg.name << " (" << cfg.subnet_cidr << " on " << cfg.bridge_name << ")\n";
+        return 0;
+    }
+    if (args.sub_action == "ls" || args.sub_action == "list") {
+        std::cout << std::left << std::setw(20) << "NETWORK" << " " << std::setw(16) << "BRIDGE" << " SUBNET\n";
+        for (const auto& n : pieces::list_networks()) {
+            std::cout << std::left << std::setw(20) << get_str(n, "name") << " "
+                      << std::setw(16) << get_str(n, "bridge") << " "
+                      << get_str(n, "subnet") << "\n";
+        }
+        return 0;
+    }
+    if (args.sub_action == "inspect") {
+        if (args.extra_args.empty()) throw std::invalid_argument("network inspect requires <name>");
+        std::cout << pieces::JsonValue(pieces::inspect_network_json(args.extra_args[0])).dump(2) << "\n";
+        return 0;
+    }
+    if (args.sub_action == "rm") {
+        if (args.extra_args.empty()) throw std::invalid_argument("network rm requires <name>");
+        for (const auto& n : args.extra_args) {
+            pieces::remove_network(n);
+            std::cout << n << "\n";
+        }
+        return 0;
+    }
+    throw std::invalid_argument("Unknown network subcommand: " + args.sub_action);
+}
+
+int handle_login(const pieces::CliArgs& args) {
+    std::string user = args.login_username;
+    std::string pass = args.login_password;
+    if (args.password_stdin) {
+        std::getline(std::cin, pass);
+        while (!pass.empty() && (pass.back() == '\r' || pass.back() == '\n')) pass.pop_back();
+    }
+    if (user.empty() || pass.empty()) {
+        throw std::invalid_argument("login requires -u <user> and -p <password> (or --password-stdin)");
+    }
+    pieces::save_registry_credentials(args.login_registry, user, pass);
+    std::cout << "Login Succeeded for " << args.login_registry << "\n";
+    return 0;
+}
+
+int handle_compose(const pieces::CliArgs& args) {
+    std::string cfile = pieces::resolve_compose_file(args.compose_file);
+    if (args.sub_action == "up") return pieces::compose_up(cfile, args.detach, args.compose_build);
+    if (args.sub_action == "down") return pieces::compose_down(cfile);
+    if (args.sub_action == "ps") return pieces::compose_ps(cfile);
+    if (args.sub_action == "logs") return pieces::compose_logs(cfile, args.follow, args.tail_lines);
+    throw std::invalid_argument("Unknown compose subcommand: " + args.sub_action);
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -200,6 +298,25 @@ int main(int argc, char* argv[]) {
                 return handle_build(args);
             case pieces::CliCommand::Pull:
                 return handle_pull(args);
+            case pieces::CliCommand::Login:
+                return handle_login(args);
+            case pieces::CliCommand::Tag:
+                pieces::tag_image(args.src_arg, args.dst_arg);
+                return 0;
+            case pieces::CliCommand::Inspect:
+                std::cout << pieces::JsonValue(pieces::inspect_any_json(args.target_container)).dump(2) << "\n";
+                return 0;
+            case pieces::CliCommand::Cp:
+                pieces::copy_between_host_and_container(args.src_arg, args.dst_arg);
+                return 0;
+            case pieces::CliCommand::Volume:
+                return handle_volume(args);
+            case pieces::CliCommand::Network:
+                return handle_network(args);
+            case pieces::CliCommand::Compose:
+                return handle_compose(args);
+            case pieces::CliCommand::Serve:
+                return pieces::run_docker_api_server(args.socket_path);
             case pieces::CliCommand::Run:
                 return handle_run(args);
             case pieces::CliCommand::Images:

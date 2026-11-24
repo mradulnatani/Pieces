@@ -284,13 +284,17 @@ void reconcile_dead_container_resources(
             }
         }
     }
+    std::string net_name = "bridge";
+    if (auto nn = obj.find("network"); nn != obj.end() && nn->second.is_string() && !nn->second.as_string().empty()) {
+        net_name = nn->second.as_string();
+    }
     orphan_plan.bridge_name = DEFAULT_BRIDGE;
 
     if (!orphan_plan.ports.empty() && !orphan_plan.container_ip.empty()) {
         cleanup_port_forwarding(orphan_plan);
     }
     if (!orphan_plan.host_veth.empty()) cleanup_container_network(orphan_plan.host_veth);
-    release_container_ip(containers_dir, cid);
+    release_container_ip(containers_dir, cid, net_name);
     CgroupManager cg(cid);
     cg.cleanup();
     cleanup_container_rootfs(cdir.string(), method);
@@ -360,6 +364,8 @@ int run_single_container_attempt(
     const std::map<std::string, std::string>& env_map,
     const std::string& workdir,
     const std::vector<VolumeMount>& volumes,
+    const std::vector<TmpfsMount>& tmpfs_mounts,
+    const std::vector<PortMapping>& rootless_ports,
     const std::set<cap_value_t>& target_caps,
     const std::optional<SeccompProgram>& prebuilt_seccomp,
     const SecurityOptions& sec_opts,
@@ -428,7 +434,8 @@ int run_single_container_attempt(
         if (notify_parent_fd >= 0) ::close(notify_parent_fd);
 
         try {
-            int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC;
+            int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC;
+            if (config.network_mode != "host") ns_flags |= CLONE_NEWNET;
             if (use_userns) ns_flags |= CLONE_NEWUSER;
             unshare_namespaces(ns_flags);
 
@@ -484,7 +491,8 @@ int run_single_container_attempt(
                         config.readonly_rootfs,
                         {},
                         {},
-                        overlay_spec);
+                        overlay_spec,
+                        tmpfs_mounts);
 
                     if (!workdir.empty() && workdir != "/") {
                         fs::create_directories(workdir);
@@ -593,6 +601,7 @@ int run_single_container_attempt(
     ::close(ready_pipe[0]);
 
     int grandchild_pid = 0;
+    int rootless_net_pid = -1;
     if (!p2_str.empty() && std::all_of(p2_str.begin(), p2_str.end(), ::isdigit)) {
         grandchild_pid = std::stoi(p2_str);
         if (!use_userns) {
@@ -604,6 +613,8 @@ int run_single_container_attempt(
                 meta_record["ip"] = "";
                 meta_record["ports"] = JsonArray{};
             }
+        } else if (use_userns && ::geteuid() != 0 && config.network_mode == "bridge") {
+            rootless_net_pid = setup_rootless_userspace_network(grandchild_pid, rootless_ports);
         }
         if (!config.auto_remove || config.detach) {
             meta_record["pid"] = static_cast<int64_t>(grandchild_pid);
@@ -646,6 +657,7 @@ int run_single_container_attempt(
         cleanup_port_forwarding(*net_plan);
         cleanup_container_network(net_plan->host_veth);
     }
+    if (rootless_net_pid > 0) cleanup_rootless_userspace_network(rootless_net_pid);
     cgroup_mgr.cleanup();
     return exit_code;
 }
@@ -662,6 +674,8 @@ int execute_container_supervisor(
     const std::map<std::string, std::string>& env_map,
     const std::string& workdir,
     const std::vector<VolumeMount>& volumes,
+    const std::vector<TmpfsMount>& tmpfs_mounts,
+    const std::vector<PortMapping>& rootless_ports,
     const std::set<cap_value_t>& target_caps,
     const std::optional<SeccompProgram>& prebuilt_seccomp,
     const SecurityOptions& sec_opts,
@@ -678,7 +692,7 @@ int execute_container_supervisor(
     while (true) {
         exit_code = run_single_container_attempt(
             config, container_id, hostname, image_path, container_dir, rootfs,
-            command, env_map, workdir, volumes, target_caps,
+            command, env_map, workdir, volumes, tmpfs_mounts, rootless_ports, target_caps,
             prebuilt_seccomp, sec_opts, user_spec,
             net_plan, cgroup_mgr, use_userns, meta_record, notify_parent_fd, profiler);
 
@@ -696,7 +710,9 @@ int execute_container_supervisor(
         backoff_ms = std::min(5000, backoff_ms * 2);
     }
 
-    if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id);
+    if (net_plan.has_value()) {
+        release_container_ip(config.containers_dir, container_id, net_plan->network_name);
+    }
     cleanup_container_rootfs(container_dir, rootfs.method);
 
     if (config.auto_remove) {
@@ -788,6 +804,158 @@ std::string restart_policy_to_string(RestartPolicy policy) {
 
 std::size_t parse_byte_size(const std::string& spec) {
     return static_cast<std::size_t>(parse_memory_limit(spec));
+}
+
+std::vector<std::string> load_env_file(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Cannot open --env-file: " + path);
+    std::vector<std::string> specs;
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        size_t b = 0;
+        while (b < line.size() && std::isspace(static_cast<unsigned char>(line[b]))) ++b;
+        line = line.substr(b);
+        if (line.empty() || line[0] == '#') continue;
+        auto eq = line.find('=');
+        if (eq != std::string::npos) {
+            std::string k = line.substr(0, eq);
+            std::string v = line.substr(eq + 1);
+            if (v.size() >= 2 &&
+                ((v.front() == '"' && v.back() == '"') || (v.front() == '\'' && v.back() == '\''))) {
+                v = v.substr(1, v.size() - 2);
+            }
+            specs.push_back(k + "=" + v);
+        } else {
+            specs.push_back(line);
+        }
+    }
+    return specs;
+}
+
+JsonObject inspect_container_json(const std::string& identifier, const std::string& containers_dir) {
+    auto target_opt = find_container_dir(identifier, containers_dir);
+    if (!target_opt.has_value()) throw std::runtime_error("Container '" + identifier + "' not found");
+    auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
+    if (!meta.has_value()) throw std::runtime_error("Container metadata missing for '" + identifier + "'");
+    JsonObject out = *meta;
+    out["containerDir"] = fs::absolute(*target_opt).string();
+    std::string cid = fs::path(*target_opt).filename().string();
+    CgroupManager cg(cid);
+    auto st = cg.stats();
+    out["cgroup"] = JsonObject{
+        {"memoryCurrentBytes", static_cast<int64_t>(st.memory_current_bytes)},
+        {"memoryMaxBytes", static_cast<int64_t>(st.memory_max_bytes)},
+        {"cpuUsageUsec", static_cast<int64_t>(st.cpu_usage_usec)},
+        {"pidsCurrent", static_cast<int64_t>(st.pids_current)},
+        {"pidsMax", static_cast<int64_t>(st.pids_max)},
+    };
+    return out;
+}
+
+JsonObject inspect_any_json(
+    const std::string& identifier,
+    const std::string& image_dir,
+    const std::string& containers_dir) {
+    if (find_container_dir(identifier, containers_dir).has_value()) {
+        return inspect_container_json(identifier, containers_dir);
+    }
+    try {
+        return inspect_image_json(identifier, image_dir);
+    } catch (const std::exception&) {
+    }
+    throw std::runtime_error("No container or image found matching '" + identifier + "'");
+}
+
+void copy_between_host_and_container(
+    const std::string& src_spec,
+    const std::string& dst_spec,
+    const std::string& image_dir,
+    const std::string& containers_dir) {
+    auto split_ref = [](const std::string& s) -> std::optional<std::pair<std::string, std::string>> {
+        auto colon = s.find(':');
+        if (colon == std::string::npos || colon == 0) return std::nullopt;
+        return std::make_pair(s.substr(0, colon), s.substr(colon + 1));
+    };
+
+    auto src_c = split_ref(src_spec);
+    auto dst_c = split_ref(dst_spec);
+    if (src_c.has_value() == dst_c.has_value()) {
+        throw std::invalid_argument("Exactly one side of `pieces cp` must be CONTAINER:PATH");
+    }
+
+    auto resolve_container_root = [&](const std::string& ident, bool for_write) -> fs::path {
+        auto cdir_opt = find_container_dir(ident, containers_dir);
+        if (!cdir_opt.has_value()) throw std::runtime_error("Container '" + ident + "' not found");
+        auto meta = read_meta_object(fs::path(*cdir_opt) / "meta.json");
+        if (meta.has_value()) {
+            if (auto p = meta->find("pid"); p != meta->end() && p->second.is_int() && p->second.as_int() > 0) {
+                int pid = static_cast<int>(p->second.as_int());
+                if (is_pid_alive(pid)) {
+                    fs::path proc_root = fs::path("/proc") / std::to_string(pid) / "root";
+                    std::error_code ec;
+                    if (fs::exists(proc_root, ec)) return proc_root;
+                }
+            }
+            if (for_write) {
+                fs::path up = fs::path(*cdir_opt) / "upper";
+                if (fs::is_directory(up)) return up;
+            }
+            if (!for_write) {
+                fs::path up = fs::path(*cdir_opt) / "upper";
+                if (fs::is_directory(up)) return up;
+            }
+            if (auto img = meta->find("image"); img != meta->end() && img->second.is_string()) {
+                return fs::path(resolve_image_path(img->second.as_string(), image_dir));
+            }
+        }
+        return fs::path(*cdir_opt) / "rootfs";
+    };
+
+    auto copy_item = [](const fs::path& from, const fs::path& to) {
+        if (!fs::exists(from)) throw std::runtime_error("Copy source does not exist: '" + from.string() + "'");
+        if (fs::is_directory(from)) {
+            fs::create_directories(to);
+            fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::copy_symlinks | fs::copy_options::overwrite_existing);
+        } else {
+            if (fs::is_directory(to)) {
+                fs::copy_file(from, to / from.filename(), fs::copy_options::overwrite_existing);
+            } else {
+                fs::create_directories(to.parent_path());
+                fs::copy_file(from, to, fs::copy_options::overwrite_existing);
+            }
+        }
+    };
+
+    auto join_safe = [](const fs::path& root, std::string rel) -> fs::path {
+        while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+        fs::path target = fs::weakly_canonical(root / rel);
+        fs::path root_real = fs::weakly_canonical(root);
+        auto check = target.lexically_relative(root_real);
+        if (!check.empty() && *check.begin() == "..") {
+            throw std::invalid_argument("Container copy path escapes rootfs");
+        }
+        return target;
+    };
+
+    if (src_c.has_value()) {
+        fs::path croot = resolve_container_root(src_c->first, false);
+        fs::path csrc = join_safe(croot, src_c->second);
+        if (!fs::exists(csrc)) {
+            // Fall back to base image rootfs when copying from stopped overlay upperdir
+            auto cdir_opt = find_container_dir(src_c->first, containers_dir);
+            auto meta = cdir_opt ? read_meta_object(fs::path(*cdir_opt) / "meta.json") : std::nullopt;
+            if (meta && meta->contains("image")) {
+                fs::path img_root(resolve_image_path(meta->at("image").as_string(), image_dir));
+                csrc = join_safe(img_root, src_c->second);
+            }
+        }
+        copy_item(csrc, fs::path(dst_spec));
+    } else {
+        fs::path croot = resolve_container_root(dst_c->first, true);
+        fs::path cdst = join_safe(croot, dst_c->second);
+        copy_item(fs::path(src_spec), cdst);
+    }
 }
 
 JsonObject load_image_metadata(const std::string& image_path) {
@@ -1156,8 +1324,24 @@ int run_container(const ContainerRunConfig& config) {
     std::string container_dir = (fs::path(config.containers_dir) / container_id).string();
 
     JsonObject metadata = load_image_metadata(image_path);
+    if (config.entrypoint_override.has_value()) {
+        if (config.entrypoint_override->empty()) {
+            metadata.erase("entrypoint");
+        } else {
+            JsonArray arr;
+            for (const auto& tok : parse_command_value(*config.entrypoint_override)) arr.emplace_back(tok);
+            metadata["entrypoint"] = std::move(arr);
+        }
+    }
     std::vector<std::string> command = resolve_command(config.cmd_args, metadata);
-    std::map<std::string, std::string> env_map = build_container_env(metadata, config.env_specs, hostname);
+
+    std::vector<std::string> merged_env_specs;
+    for (const auto& ef : config.env_files) {
+        auto loaded = load_env_file(ef);
+        merged_env_specs.insert(merged_env_specs.end(), loaded.begin(), loaded.end());
+    }
+    merged_env_specs.insert(merged_env_specs.end(), config.env_specs.begin(), config.env_specs.end());
+    std::map<std::string, std::string> env_map = build_container_env(metadata, merged_env_specs, hostname);
 
     std::string workdir = "/";
     if (config.workdir.has_value()) {
@@ -1168,7 +1352,13 @@ int run_container(const ContainerRunConfig& config) {
 
     std::vector<VolumeMount> volumes;
     volumes.reserve(config.volume_specs.size());
-    for (const auto& vs : config.volume_specs) volumes.push_back(parse_volume_spec(vs));
+    for (const auto& vs : config.volume_specs) {
+        volumes.push_back(parse_volume_spec(vs, config.volumes_dir));
+    }
+
+    std::vector<TmpfsMount> tmpfs_mounts;
+    tmpfs_mounts.reserve(config.tmpfs_specs.size());
+    for (const auto& ts : config.tmpfs_specs) tmpfs_mounts.push_back(parse_tmpfs_spec(ts));
 
     std::vector<PortMapping> ports;
     ports.reserve(config.port_specs.size());
@@ -1177,6 +1367,9 @@ int run_container(const ContainerRunConfig& config) {
     std::optional<UserSpec> user_spec;
     if (config.user_spec.has_value()) {
         user_spec = parse_user_spec(*config.user_spec);
+    } else if (auto u_it = metadata.find("user"); u_it != metadata.end() && u_it->second.is_string() &&
+               !u_it->second.as_string().empty()) {
+        user_spec = parse_user_spec(u_it->second.as_string());
     }
     if (config.run_as_non_root && (!user_spec.has_value() || user_spec->uid == 0)) {
         throw std::invalid_argument("--run-as-non-root requires a non-zero --user UID[:GID]");
@@ -1206,14 +1399,53 @@ int run_container(const ContainerRunConfig& config) {
     CgroupManager cgroup_mgr(container_id, config.memory_limit, config.cpu_limit, config.pids_limit);
 
     std::optional<ContainerNetwork> net_plan;
-    if (config.network_mode == "bridge") {
+    if (config.network_mode != "none" && config.network_mode != "host") {
         if (!host_is_root) {
             if (!ports.empty()) {
-                std::cerr << "NETWORK: Warning: -p port forwarding requires root/CAP_NET_ADMIN; skipped in rootless mode.\n";
+                std::cerr << "NETWORK: Info: rootless -p forwarding uses pasta if installed.\n";
             }
-        } else if (setup_host_network(DEFAULT_BRIDGE, DEFAULT_BRIDGE_CIDR, DEFAULT_SUBNET_CIDR, true, config.isolate_net)) {
-            net_plan = build_network_plan(container_id, config.containers_dir, ports);
+        } else {
+            NetworkConfig ncfg = load_network_config(config.network_mode, config.networks_dir);
+            bool iso = ncfg.isolate && config.isolate_net;
+            if (setup_host_network(ncfg.bridge_name, ncfg.gateway_ip + "/24", ncfg.subnet_cidr, true, iso)) {
+                net_plan = build_network_plan(container_id, config.containers_dir, ports, ncfg.name, config.networks_dir);
+            }
         }
+    }
+
+    // Generate custom /etc/hosts and /etc/resolv.conf bind mounts if --add-host, --dns, or peer discovery apply
+    if (!config.add_hosts.empty() || (net_plan.has_value() && config.network_mode != "bridge")) {
+        std::ostringstream hss;
+        hss << "127.0.0.1\tlocalhost " << hostname << "\n::1\t\tlocalhost\n";
+        if (net_plan.has_value()) {
+            hss << net_plan->container_ip << "\t" << container_name << "\n";
+            for (const auto& [pname, pip] : collect_network_peers(config.containers_dir, config.network_mode)) {
+                hss << pip << "\t" << pname << " " << pname << ".pieces\n";
+            }
+        }
+        for (const auto& ah : config.add_hosts) {
+            auto colon = ah.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 >= ah.size()) {
+                throw std::invalid_argument("Invalid --add-host '" + ah + "'; expected HOST:IP");
+            }
+            hss << ah.substr(colon + 1) << "\t" << ah.substr(0, colon) << "\n";
+        }
+        fs::create_directories(container_dir);
+        fs::path hosts_gen = fs::path(container_dir) / "hosts.gen";
+        {
+            std::ofstream hf(hosts_gen);
+            hf << hss.str();
+        }
+        volumes.push_back({fs::absolute(hosts_gen).string(), "/etc/hosts", true});
+    }
+    if (!config.dns_servers.empty()) {
+        fs::create_directories(container_dir);
+        fs::path resolv_gen = fs::path(container_dir) / "resolv.gen";
+        {
+            std::ofstream rf(resolv_gen);
+            for (const auto& ns : config.dns_servers) rf << "nameserver " << ns << "\n";
+        }
+        volumes.push_back({fs::absolute(resolv_gen).string(), "/etc/resolv.conf", true});
     }
     profiler.mark("host network + IPAM");
 
@@ -1243,6 +1475,7 @@ int run_container(const ContainerRunConfig& config) {
     meta_record["command"] = join_args(command);
     meta_record["status"] = "running";
     meta_record["pid"] = static_cast<int64_t>(0);
+    meta_record["network"] = config.network_mode;
     meta_record["ip"] = net_plan.has_value() ? net_plan->container_ip : "";
     meta_record["host_veth"] = net_plan.has_value() ? net_plan->host_veth : "";
     meta_record["ports"] = std::move(port_arr);
@@ -1260,14 +1493,14 @@ int run_container(const ContainerRunConfig& config) {
         int dummy_fd = -1;
         return execute_container_supervisor(
             config, container_id, container_name, hostname, image_path, container_dir, rootfs,
-            command, env_map, workdir, volumes, target_caps,
+            command, env_map, workdir, volumes, tmpfs_mounts, ports, target_caps,
             prebuilt_seccomp, sec_opts, user_spec,
             net_plan, cgroup_mgr, use_userns, meta_record, dummy_fd, profiler);
     }
 
     int sup_pipe[2]{-1, -1};
     if (::pipe(sup_pipe) != 0) {
-        if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id);
+        if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id, net_plan->network_name);
         cleanup_container_rootfs(container_dir, rootfs.method);
         throw std::system_error(errno, std::generic_category(), "pipe(detach)");
     }
@@ -1275,7 +1508,7 @@ int run_container(const ContainerRunConfig& config) {
     pid_t sup_pid = ::fork();
     if (sup_pid < 0) {
         ::close(sup_pipe[0]); ::close(sup_pipe[1]);
-        if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id);
+        if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id, net_plan->network_name);
         cleanup_container_rootfs(container_dir, rootfs.method);
         throw std::system_error(errno, std::generic_category(), "fork(detach)");
     }
@@ -1293,7 +1526,7 @@ int run_container(const ContainerRunConfig& config) {
         int notify_fd = sup_pipe[1];
         int rc = execute_container_supervisor(
             config, container_id, container_name, hostname, image_path, container_dir, rootfs,
-            command, env_map, workdir, volumes, target_caps,
+            command, env_map, workdir, volumes, tmpfs_mounts, ports, target_caps,
             prebuilt_seccomp, sec_opts, user_spec,
             net_plan, cgroup_mgr, use_userns, meta_record, notify_fd, profiler);
         ::_exit(rc);
