@@ -1,132 +1,62 @@
-# Pieces 🧩: Python based containerization tool
+# Pieces
 
-Pieces is a simple, containerization tool built entirely in Python. It's designed to demystify the "magic" behind tools like Docker by building a container runtime from its fundamental components—the "pieces" of containerization. This project serves as a hands-on guide to the core Linux technologies that make modern containers possible.
-✨ Features
-<ol>
-<b>- Build Images: Create container images from a simple, declarative Piecefile, similar to a Dockerfile.</b>
+Pieces is a lightweight Linux container runtime written in **C++20** using direct Linux syscalls (namespaces, `pivot_root`, OverlayFS with copy fallback), `libcurl`, `libarchive`, `veth` + bridge networking, and cgroups v2.
 
-<b>- Flexible Image Sources: Supports building from both friendly, known distribution names (e.g., alpine:3.18) and direct URLs to root filesystem tarballs.</b>
+For a step-by-step walkthrough on building, operating, and integrating Pieces into your own project, see [TUTORIAL.md](TUTORIAL.md).
 
-<b>- Run Containers: Run commands inside a fully isolated environment using the images you've built.</b>
+## Architecture
 
-<b>- True Process Isolation: Uses PID Namespaces to ensure processes inside the container cannot see or affect processes on the host.</b>
+```text
+CMakeLists.txt             CMake build configuration (C++20, libcurl, libarchive)
+include/pieces/*.hpp       Public module interfaces
+src/
+├── main.cpp               CLI entry point
+├── cli.cpp                Subcommand & flag parsing (build, run, images, ps, rm, rmi)
+├── parser.cpp             Piecefile parser (FROM, FROM_URL, COPY, ENV, WORKDIR, CMD, ENTRYPOINT)
+├── json.cpp               Self-contained JSON parser/serializer
+├── filesystem.cpp         libcurl downloads, safe libarchive extraction, OverlayFS / copy rootfs
+├── namespaces.cpp         Direct Linux syscalls (unshare, mount, umount2, pivot_root, sethostname)
+├── network.cpp            Host bridge (pieces-br0), veth pairs, IPAM, NAT masquerading
+├── cgroup.cpp             Cgroup v2 resource limits (memory.max, cpu.max, pids.max)
+└── container.cpp          Container lifecycle, pipe sync, state tracking, exit-code propagation
+```
 
-<b>- Robust Filesystem Isolation: Uses the powerful pivot_root system call, the same mechanism used by professional runtimes, to give the container a completely separate and stable root filesystem.</b>
-</ol>
-🗺️ The Journey: Problems We Faced & Concepts Learned
+## Requirements
 
-Building a container runtime is a journey through the depths of the Linux kernel. Here are the major challenges we faced and the concepts we learned to overcome them.
-Part 1: The Foundation - "How do I run a command?"
+- **OS:** Linux (any architecture supported by `<sys/syscall.h>` `SYS_pivot_root`)
+- **Build tools:** CMake 3.20+, C++20 compiler (`g++` 13+ or `clang++`), `libcurl` dev headers, `libarchive` dev headers
+- **Privileges:** Root or `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` for namespaces, `mount`/`pivot_root`, `veth` networking, and cgroups v2
+- **Host networking tools:** `iproute2` (`ip`), `util-linux` (`nsenter`), and optionally `iptables` for NAT masquerading
 
-The first step was to simply run a command like ls as a child process.
+## Building from Source
 
-    Concept Learned: fork() and exec()
-    We learned that this is a two-step dance in Linux. First, os.fork() creates an identical copy of our script (the child). Then, os.execvp() transforms that child into a new program (like ls or /bin/sh). This fork-exec model is the foundation of all process creation in Linux.
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 
-Part 2: Isolation - "How do I hide the host?"
+This produces the native `./build/pieces` binary and `./build/pieces_tests` test runner.
 
-Our first container could still see every process on the host machine. The next challenge was to isolate it.
+## Quick CLI Usage
 
-    Concept Learned: Linux Namespaces (CLONE_NEWPID)
-    We used ctypes to call the unshare system call with the CLONE_NEWPID flag. This placed our child process in its own "private room" where it became PID 1 and could no longer see the host's process tree.
+```bash
+# Build an image from Piecefile
+./build/pieces build .
+./build/pieces build . --tag my-ubuntu
 
-    Problem Faced: The "Leaky" /proc Filesystem
-    Even with a new PID namespace, running ps aux inside the container still showed all the host's processes!
+# Run a container
+sudo ./build/pieces run --rm --name web --memory 256m --cpus 0.5 ubuntu-22.04 /bin/sh -c "uname -a && ip addr"
+sudo ./build/pieces run -e FOO=bar -v "$PWD:/workspace:ro" --net none ubuntu-22.04 /bin/ls -la /workspace
 
-    Concept Learned: Virtual Filesystems
-    We discovered that ps gets its information by reading the /proc filesystem. We were mounting the host's /proc directly into the container, giving it a "security monitor" to see the outside world. The final fix was to mount a new, correctly-scoped /proc after entering the new PID namespace, ensuring the container could only see itself.
+# Inspect and clean up
+./build/pieces images
+./build/pieces ps -a
+./build/pieces rm web
+./build/pieces rmi ubuntu-22.04
+```
 
-Part 3: The Final, Vicious Bug - "Why does my second command fail?"
+## Running Tests
 
-This was the most difficult and frustrating challenge. After upgrading our filesystem logic to use pivot_root, our container would start perfectly. The first command (ls) would work, but any subsequent command would fail with a misleading error: /bin/sh: can't fork: Out of memory.
-
-    Problem Faced: Unstable Environment
-    We were not out of memory. This generic error meant the shell was in an unstable state and the kernel was refusing its request to fork a new process.
-
-    Concept Learned: Mount Propagation (MS_PRIVATE)
-    The root cause was a deep kernel feature. By default, a new mount namespace can still "share" filesystem events with the host. This "leaky" connection was destabilizing our pivot_root environment. The definitive fix was to add one more mount command after creating the namespace to make the container's entire filesystem view recursively private, severing the final link to the host.
-
-    Concept Learned: The "Double Fork"
-    We further stabilized the environment by separating the "setup" process from the final "user" process. The first child creates the isolated environment, then forks a "pristine" grandchild to actually run the user's command. This ensures the final process is completely clean, solving the instability for good.
-
-🛠️ Usage Tutorial
-
-Using Pieces is a two-step process: build an image from a recipe, then run a container from that image.
-1. The Piecefile
-
-This is a simple text file that acts as the recipe for your container. It must be named Piecefile and placed in your build directory.
-
-Keywords:
-
-    FROM <image>:<tag> (Recommended): Tells Pieces to build from a known, reliable distribution. The following images are currently supported:
-
-        alpine:3.18
-
-        ubuntu:22.04
-
-        fedora:38
-
-    FROM_URL <url> (Advanced): Tells Pieces to download a root filesystem from any direct URL to a compatible .tar.gz file.
-
-    CMD <command>: Sets the default command to run when the container starts.
-
-Example Piecefile for Ubuntu:
-
-# The new, user-friendly Piecefile for Ubuntu 22.04
-FROM ubuntu:22.04
-
-# The default command to run is the bash shell
-CMD /bin/bash
-
-2. The build Command
-
-This command reads your Piecefile, downloads the necessary files, and creates a reusable image in a hidden .pieces/ directory.
-
-# Assuming 'pieces' has been installed as a binary
-sudo pieces build .
-
-3. The run Command
-
-This command starts a container from a pre-built image.
-
-    To run the default command (from CMD):
-
-    # Use the image name from the Piecefile's FROM tag
-    sudo pieces run ubuntu-22.04
-
-    To run a specific command inside the container:
-
-    # This will run 'ps aux' inside the container and exit
-    sudo pieces run ubuntu-22.04 ps aux
-
-📦 Installation: From Script to System Command
-
-To use "Pieces" like a real command-line tool (e.g., sudo pieces build .), you need to build a standalone binary and move it to a directory on your system's PATH.
-Prerequisites
-
-    A Linux operating system (tested on Ubuntu).
-
-    Python 3.6+.
-
-    Root privileges (sudo) are required for all operations.
-
-Installation Steps
-
-    git clone https://github.com/mradulnatani/Pieces.git
-    cd Pieces
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
-    pip install pyinstaller
-    pyinstaller --onefile --add-data 'src:src' pieces.py
-    sudo mv dist/pieces /usr/local/bin/pieces
-    # Test it out!
-    sudo pieces --help
-
-🔮 Future Work
-
-    Networking: Implement network namespaces to give containers their own private network stack.
-
-    Resource Limits: Use cgroups to control the amount of CPU and memory a container can consume.
-
-    Image Management: Add commands like pieces images to list built images and pieces rmi to remove them.
+```bash
+ctest --test-dir build --output-on-failure
+```
