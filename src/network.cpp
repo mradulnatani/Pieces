@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -45,25 +46,22 @@ bool command_exists(const std::string& cmd) {
     return false;
 }
 
-void enable_ip_forwarding() {
-    const char* fwd_path = "/proc/sys/net/ipv4/ip_forward";
+void write_proc_sysctl(const char* path, const char* value) {
     std::error_code ec;
-    if (!fs::exists(fwd_path, ec)) {
+    if (!fs::exists(path, ec)) {
         return;
     }
     {
-        std::ifstream in(fwd_path);
-        std::string val;
-        if (in >> val && val == "1") {
+        std::ifstream in(path);
+        std::string cur;
+        if (in >> cur && cur == value) {
             return;
         }
     }
-    std::ofstream out(fwd_path);
-    if (!out) {
-        std::cerr << "NETWORK: Warning: could not enable IPv4 forwarding.\n";
-        return;
+    std::ofstream out(path);
+    if (out) {
+        out << value << "\n";
     }
-    out << "1\n";
 }
 
 void ensure_nat_masquerade(const std::string& bridge_name, const std::string& subnet_cidr) {
@@ -82,7 +80,104 @@ void ensure_nat_masquerade(const std::string& bridge_name, const std::string& su
     }
 }
 
+std::vector<std::vector<std::string>> build_port_iptables_rules(
+    const ContainerNetwork& plan,
+    const PortMapping& pm,
+    const char* action) {
+    std::string dest = plan.container_ip + ":" + std::to_string(pm.container_port);
+    std::string hport = std::to_string(pm.host_port);
+    std::string cport = std::to_string(pm.container_port);
+
+    std::vector<std::string> prerouting = {
+        "iptables", "-t", "nat", action, "PREROUTING",
+        "!", "-i", plan.bridge_name,
+        "-p", pm.protocol, "--dport", hport,
+        "-j", "DNAT", "--to-destination", dest,
+    };
+    if (!pm.host_ip.empty()) {
+        prerouting.insert(prerouting.begin() + 5, {"-d", pm.host_ip});
+    }
+
+    std::vector<std::string> output_local = {
+        "iptables", "-t", "nat", action, "OUTPUT",
+        "-d", pm.host_ip.empty() ? "127.0.0.1" : pm.host_ip,
+        "-p", pm.protocol, "--dport", hport,
+        "-j", "DNAT", "--to-destination", dest,
+    };
+
+    std::vector<std::string> forward_in = {
+        "iptables", action, "FORWARD",
+        "-p", pm.protocol, "-d", plan.container_ip, "--dport", cport,
+        "-j", "ACCEPT",
+    };
+
+    return {prerouting, output_local, forward_in};
+}
+
+int parse_port_number(const std::string& s) {
+    if (s.empty() || !std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        throw std::invalid_argument("Invalid port number: '" + s + "'");
+    }
+    int port = std::stoi(s);
+    if (port < 1 || port > 65535) {
+        throw std::invalid_argument("Port out of range (1-65535): '" + s + "'");
+    }
+    return port;
+}
+
 }  // namespace
+
+PortMapping parse_port_mapping(const std::string& spec) {
+    std::string addr_part = spec;
+    std::string proto = "tcp";
+    auto slash = spec.rfind('/');
+    if (slash != std::string::npos) {
+        proto = spec.substr(slash + 1);
+        for (char& c : proto) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (proto != "tcp" && proto != "udp") {
+            throw std::invalid_argument("Unsupported port protocol '" + proto + "'; expected tcp or udp");
+        }
+        addr_part = spec.substr(0, slash);
+    }
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (true) {
+        size_t colon = addr_part.find(':', start);
+        if (colon == std::string::npos) {
+            parts.push_back(addr_part.substr(start));
+            break;
+        }
+        parts.push_back(addr_part.substr(start, colon - start));
+        start = colon + 1;
+    }
+
+    PortMapping pm;
+    pm.protocol = proto;
+    if (parts.size() == 2) {
+        pm.host_port = parse_port_number(parts[0]);
+        pm.container_port = parse_port_number(parts[1]);
+    } else if (parts.size() == 3) {
+        pm.host_ip = parts[0];
+        pm.host_port = parse_port_number(parts[1]);
+        pm.container_port = parse_port_number(parts[2]);
+    } else {
+        throw std::invalid_argument(
+            "Invalid port specification '" + spec + "'; expected [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp|udp]");
+    }
+    return pm;
+}
+
+std::string format_port_mapping(const PortMapping& pm) {
+    std::string out;
+    if (!pm.host_ip.empty()) {
+        out += pm.host_ip + ":";
+    }
+    out += std::to_string(pm.host_port) + "->" + std::to_string(pm.container_port) + "/" + pm.protocol;
+    return out;
+}
 
 int run_host_cmd(const std::vector<std::string>& args, bool quiet) {
     if (args.empty()) {
@@ -144,7 +239,9 @@ bool setup_host_network(
     }
 
     if (enable_nat) {
-        enable_ip_forwarding();
+        write_proc_sysctl("/proc/sys/net/ipv4/ip_forward", "1");
+        std::string localnet_path = "/proc/sys/net/ipv4/conf/" + bridge_name + "/route_localnet";
+        write_proc_sysctl(localnet_path.c_str(), "1");
         ensure_nat_masquerade(bridge_name, subnet_cidr);
     }
     return true;
@@ -187,7 +284,10 @@ std::string allocate_container_ip(const std::string& containers_dir) {
     throw std::runtime_error("No free IP addresses left in 10.0.0.0/24");
 }
 
-ContainerNetwork build_network_plan(const std::string& container_id, const std::string& containers_dir) {
+ContainerNetwork build_network_plan(
+    const std::string& container_id,
+    const std::string& containers_dir,
+    const std::vector<PortMapping>& ports) {
     std::string cleaned = container_id;
     cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '-'), cleaned.end());
     std::string short_id = cleaned.substr(0, 8);
@@ -198,7 +298,41 @@ ContainerNetwork build_network_plan(const std::string& container_id, const std::
         24,
         "vp-" + short_id,
         "vc-" + short_id,
+        ports,
     };
+}
+
+bool setup_port_forwarding(const ContainerNetwork& plan) {
+    if (plan.ports.empty()) {
+        return true;
+    }
+    if (!command_exists("iptables")) {
+        std::cerr << "NETWORK: Warning: `iptables` not found; skipping -p port forwarding.\n";
+        return false;
+    }
+    write_proc_sysctl("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
+    for (const auto& pm : plan.ports) {
+        for (const auto& cmd : build_port_iptables_rules(plan, pm, "-A")) {
+            if (run_host_cmd(cmd, false) != 0) {
+                std::cerr << "NETWORK: Warning: failed to apply port rule for "
+                          << format_port_mapping(pm) << "\n";
+                cleanup_port_forwarding(plan);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void cleanup_port_forwarding(const ContainerNetwork& plan) {
+    if (plan.ports.empty() || !command_exists("iptables")) {
+        return;
+    }
+    for (const auto& pm : plan.ports) {
+        for (const auto& cmd : build_port_iptables_rules(plan, pm, "-D")) {
+            run_host_cmd(cmd, true);
+        }
+    }
 }
 
 bool setup_container_network(int pid, const ContainerNetwork& plan) {
@@ -236,6 +370,8 @@ bool setup_container_network(int pid, const ContainerNetwork& plan) {
         cleanup_container_network(plan.host_veth);
         return false;
     }
+
+    setup_port_forwarding(plan);
     return true;
 }
 

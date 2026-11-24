@@ -1,6 +1,6 @@
 # Pieces
 
-Pieces is a lightweight Linux container runtime written in **C++20** using direct Linux syscalls (namespaces, `pivot_root`, OverlayFS with copy fallback), `libcurl`, `libarchive`, `veth` + bridge networking, and cgroups v2.
+Pieces is a lightweight Linux container runtime written in **C++20** using direct Linux syscalls (namespaces, `pivot_root`, OverlayFS with copy fallback), OCI registry pulling, build-time `RUN` execution, `veth` + bridge networking with `-p` port forwarding, detached lifecycle (`-d`, `stop`, `logs`, `exec`), rootless `CLONE_NEWUSER` support, and cgroups v2.
 
 For a step-by-step walkthrough on building, operating, and integrating Pieces into your own project, see [TUTORIAL.md](TUTORIAL.md).
 
@@ -11,22 +11,23 @@ CMakeLists.txt             CMake build configuration (C++20, libcurl, libarchive
 include/pieces/*.hpp       Public module interfaces
 src/
 ├── main.cpp               CLI entry point
-├── cli.cpp                Subcommand & flag parsing (build, run, images, ps, rm, rmi)
-├── parser.cpp             Piecefile parser (FROM, FROM_URL, COPY, ENV, WORKDIR, CMD, ENTRYPOINT)
+├── cli.cpp                Subcommand & flag parsing (build, pull, run, images, ps, stop, logs, exec, rm, rmi)
+├── parser.cpp             Piecefile parser (FROM, FROM_URL, COPY, RUN, ENV, WORKDIR, CMD, ENTRYPOINT)
 ├── json.cpp               Self-contained JSON parser/serializer
-├── filesystem.cpp         libcurl downloads, safe libarchive extraction, OverlayFS / copy rootfs
-├── namespaces.cpp         Direct Linux syscalls (unshare, mount, umount2, pivot_root, sethostname)
-├── network.cpp            Host bridge (pieces-br0), veth pairs, IPAM, NAT masquerading
+├── registry.cpp           OCI / Docker Hub v2 pull client (Bearer auth, multi-arch index, layer config)
+├── filesystem.cpp         libcurl downloads, safe libarchive + OCI whiteout extraction, build RUN, OverlayFS
+├── namespaces.cpp         Direct Linux syscalls (unshare, setns, mount, umount2, pivot_root, uid/gid_map)
+├── network.cpp            Host bridge (pieces-br0), veth pairs, IPAM, NAT masquerading, iptables -p DNAT
 ├── cgroup.cpp             Cgroup v2 resource limits (memory.max, cpu.max, pids.max)
-└── container.cpp          Container lifecycle, pipe sync, state tracking, exit-code propagation
+└── container.cpp          Foreground/detached container supervisor, stop/logs/exec, exit-code propagation
 ```
 
 ## Requirements
 
 - **OS:** Linux (any architecture supported by `<sys/syscall.h>` `SYS_pivot_root`)
 - **Build tools:** CMake 3.20+, C++20 compiler (`g++` 13+ or `clang++`), `libcurl` dev headers, `libarchive` dev headers
-- **Privileges:** Root or `CAP_SYS_ADMIN` / `CAP_NET_ADMIN` for namespaces, `mount`/`pivot_root`, `veth` networking, and cgroups v2
-- **Host networking tools:** `iproute2` (`ip`), `util-linux` (`nsenter`), and optionally `iptables` for NAT masquerading
+- **Privileges:** Root (`CAP_SYS_ADMIN` / `CAP_NET_ADMIN`) for bridge networking, `-p` port forwarding, and cgroups; unprivileged users can run rootless containers (`CLONE_NEWUSER`) when host user namespaces are enabled.
+- **Host networking tools:** `iproute2` (`ip`), `util-linux` (`nsenter`), and `iptables` for NAT / `-p` port forwarding.
 
 ## Building from Source
 
@@ -35,24 +36,21 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This produces the native `./build/pieces` binary and `./build/pieces_tests` test runner.
-
 ## Quick CLI Usage
 
 ```bash
-# Build an image from Piecefile
-./build/pieces build .
-./build/pieces build . --tag my-ubuntu
+# Pull any OCI/Docker Hub image or build a Piecefile (executes COPY and RUN in order)
+./build/pieces pull python:3.12-alpine
+./build/pieces build . --tag my-app
 
-# Run a container
-sudo ./build/pieces run --rm --name web --memory 256m --cpus 0.5 ubuntu-22.04 /bin/sh -c "uname -a && ip addr"
-sudo ./build/pieces run -e FOO=bar -v "$PWD:/workspace:ro" --net none ubuntu-22.04 /bin/ls -la /workspace
-
-# Inspect and clean up
-./build/pieces images
+# Run foreground, detached (-d), or rootless (--rootless) with port forwarding & limits
+sudo ./build/pieces run -d --name web -p 8080:80 --memory 256m --cpus 0.5 my-app
 ./build/pieces ps -a
+./build/pieces logs -n 50 web
+sudo ./build/pieces exec web /bin/sh -c "id && ip addr"
+sudo ./build/pieces stop web
 ./build/pieces rm web
-./build/pieces rmi ubuntu-22.04
+./build/pieces rmi my-app
 ```
 
 ## Running Tests

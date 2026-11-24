@@ -8,6 +8,7 @@
 
 #include "pieces/json.hpp"
 #include "pieces/parser.hpp"
+#include "pieces/registry.hpp"
 
 namespace pieces {
 
@@ -27,13 +28,21 @@ struct RootfsSetup {
 };
 
 using DownloadFn = std::function<void(const std::string& url, const std::string& dest_path)>;
+using RunStepFn = std::function<int(
+    const std::string& rootfs_dir,
+    const std::string& command,
+    const std::map<std::string, std::string>& env,
+    const std::string& workdir)>;
 
 [[nodiscard]] const std::map<std::string, std::string>& known_images();
 [[nodiscard]] std::string validate_name(const std::string& name, const std::string& kind = "image");
 [[nodiscard]] std::string derive_image_name(const PiecefileSpec& spec, const std::string& tag = "");
 [[nodiscard]] std::string resolve_image_path(const std::string& image_name, const std::string& image_dir = IMAGE_DIR);
 
-void safe_extract_tar_file(const std::string& tar_path, const std::string& dest_dir);
+void safe_extract_tar_file(
+    const std::string& tar_path,
+    const std::string& dest_dir,
+    bool handle_oci_whiteouts = false);
 void apply_copies(
     const std::vector<std::pair<std::string, std::string>>& copies,
     const std::string& context_dir,
@@ -43,7 +52,9 @@ void apply_copies(
     const PiecefileSpec& spec,
     const std::string& image_path,
     const std::string& context_dir = ".",
-    const DownloadFn& downloader = nullptr);
+    const DownloadFn& downloader = nullptr,
+    const RunStepFn& run_step_fn = nullptr,
+    const HttpGetFn& registry_http_get = nullptr);
 
 [[nodiscard]] std::vector<ImageInfo> list_images(const std::string& image_dir = IMAGE_DIR);
 void remove_image(const std::string& image_name, const std::string& image_dir = IMAGE_DIR);

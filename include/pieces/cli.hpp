@@ -9,9 +9,13 @@ namespace pieces {
 enum class CliCommand {
     Help,
     Build,
+    Pull,
     Run,
     Images,
     Ps,
+    Stop,
+    Logs,
+    Exec,
     Rm,
     Rmi,
 };
@@ -23,12 +27,18 @@ struct CliArgs {
     std::string context;
     std::optional<std::string> tag;
 
+    // pull
+    std::string pull_ref;
+
     // run
     std::optional<std::string> name;
     bool auto_remove{false};
+    bool detach{false};
+    bool rootless{false};
     std::string network_mode{"bridge"};
     std::vector<std::string> env_specs;
     std::vector<std::string> volume_specs;
+    std::vector<std::string> port_specs;
     std::optional<std::string> memory_limit;
     std::optional<double> cpu_limit;
     std::optional<int> pids_limit;
@@ -39,6 +49,14 @@ struct CliArgs {
 
     // ps
     bool show_all{false};
+
+    // stop
+    int timeout_sec{10};
+
+    // logs
+    bool follow{false};
+    int tail_lines{-1};
+    std::string target_container;
 
     // rm
     bool force{false};
