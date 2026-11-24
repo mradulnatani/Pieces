@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -7,6 +8,7 @@
 #include "pieces/cli.hpp"
 #include "pieces/container.hpp"
 #include "pieces/filesystem.hpp"
+#include "pieces/oci_runtime.hpp"
 #include "pieces/parser.hpp"
 #include "pieces/registry.hpp"
 
@@ -71,10 +73,18 @@ int handle_run(const pieces::CliArgs& args) {
         cfg.allocate_tty = args.allocate_tty;
         cfg.rootless = args.rootless;
         cfg.privileged = args.privileged;
+        cfg.readonly_rootfs = args.readonly_rootfs;
+        cfg.full_copy = args.full_copy;
+        cfg.run_as_non_root = args.run_as_non_root;
+        cfg.isolate_net = args.isolate_net;
+        cfg.timing = args.timing;
         cfg.restart_policy = pieces::parse_restart_policy(args.restart_policy);
         cfg.log_max_bytes = pieces::parse_byte_size(args.log_max_size);
         cfg.log_max_files = args.log_max_files;
         cfg.network_mode = args.network_mode;
+        cfg.user_spec = args.user_spec;
+        cfg.seccomp_profile = args.seccomp_profile;
+        cfg.security_opts = args.security_opts;
         cfg.env_specs = args.env_specs;
         cfg.volume_specs = args.volume_specs;
         cfg.port_specs = args.port_specs;
@@ -105,15 +115,13 @@ int handle_images() {
         std::string cmd_str = "-";
         auto it = img.meta.find("cmd");
         if (it != img.meta.end()) {
-            if (it->second.is_string()) {
-                cmd_str = it->second.as_string();
-            } else if (it->second.is_array()) {
+            if (it->second.is_string()) cmd_str = it->second.as_string();
+            else if (it->second.is_array()) {
                 cmd_str.clear();
-                const auto& arr = it->second.as_array();
-                for (size_t i = 0; i < arr.size(); ++i) {
-                    if (arr[i].is_string()) {
+                for (const auto& item : it->second.as_array()) {
+                    if (item.is_string()) {
                         if (!cmd_str.empty()) cmd_str += ' ';
-                        cmd_str += arr[i].as_string();
+                        cmd_str += item.as_string();
                     }
                 }
                 if (cmd_str.empty()) cmd_str = "-";
@@ -129,17 +137,13 @@ int handle_images() {
 
 std::string get_str(const pieces::JsonObject& obj, const std::string& key, const std::string& fallback = "") {
     auto it = obj.find(key);
-    if (it != obj.end() && it->second.is_string() && !it->second.as_string().empty()) {
-        return it->second.as_string();
-    }
+    if (it != obj.end() && it->second.is_string() && !it->second.as_string().empty()) return it->second.as_string();
     return fallback;
 }
 
 std::string get_ports_str(const pieces::JsonObject& obj) {
     auto it = obj.find("ports");
-    if (it == obj.end() || !it->second.is_array() || it->second.as_array().empty()) {
-        return "-";
-    }
+    if (it == obj.end() || !it->second.is_array() || it->second.as_array().empty()) return "-";
     std::string out;
     for (const auto& item : it->second.as_array()) {
         if (item.is_string()) {
@@ -176,74 +180,6 @@ int handle_ps(const pieces::CliArgs& args) {
     return 0;
 }
 
-int handle_stop(const pieces::CliArgs& args) {
-    int rc = 0;
-    for (const auto& ident : args.containers) {
-        try {
-            if (pieces::stop_container(ident, args.timeout_sec) != 0) {
-                rc = 1;
-            }
-        } catch (const std::exception& exc) {
-            std::cerr << "stop: " << exc.what() << "\n";
-            rc = 1;
-        }
-    }
-    return rc;
-}
-
-int handle_logs(const pieces::CliArgs& args) {
-    try {
-        return pieces::show_container_logs(args.target_container, args.follow, args.tail_lines);
-    } catch (const std::exception& exc) {
-        std::cerr << "logs: " << exc.what() << "\n";
-        return 1;
-    }
-}
-
-int handle_exec(const pieces::CliArgs& args) {
-    try {
-        return pieces::exec_in_container(
-            args.target_container, args.cmd_args, args.env_specs, args.workdir, args.allocate_tty);
-    } catch (const std::exception& exc) {
-        std::cerr << "exec: " << exc.what() << "\n";
-        return 1;
-    }
-}
-
-int handle_rm(const pieces::CliArgs& args) {
-    int rc = 0;
-    for (const auto& ident : args.containers) {
-        try {
-            std::string removed_id = pieces::remove_container(ident, args.force);
-            std::cout << "Removed container " << removed_id << "\n";
-        } catch (const std::exception& exc) {
-            std::cerr << "rm: " << exc.what() << "\n";
-            rc = 1;
-        }
-    }
-    return rc;
-}
-
-int handle_rmi(const pieces::CliArgs& args) {
-    int rc = 0;
-    for (const auto& img : args.images) {
-        try {
-            pieces::remove_image(img);
-            std::cout << "Removed image " << img << "\n";
-        } catch (const std::exception& exc) {
-            std::cerr << "rmi: " << exc.what() << "\n";
-            rc = 1;
-        }
-    }
-    return rc;
-}
-
-int handle_prune() {
-    int removed = pieces::prune_unused_data();
-    std::cout << "Pruned " << removed << " unused container/cache item(s).\n";
-    return 0;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -255,32 +191,75 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    switch (args.command) {
-        case pieces::CliCommand::Help:
-            pieces::print_help();
-            return 0;
-        case pieces::CliCommand::Build:
-            return handle_build(args);
-        case pieces::CliCommand::Pull:
-            return handle_pull(args);
-        case pieces::CliCommand::Run:
-            return handle_run(args);
-        case pieces::CliCommand::Images:
-            return handle_images();
-        case pieces::CliCommand::Ps:
-            return handle_ps(args);
-        case pieces::CliCommand::Stop:
-            return handle_stop(args);
-        case pieces::CliCommand::Logs:
-            return handle_logs(args);
-        case pieces::CliCommand::Exec:
-            return handle_exec(args);
-        case pieces::CliCommand::Rm:
-            return handle_rm(args);
-        case pieces::CliCommand::Rmi:
-            return handle_rmi(args);
-        case pieces::CliCommand::Prune:
-            return handle_prune();
+    try {
+        switch (args.command) {
+            case pieces::CliCommand::Help:
+                pieces::print_help();
+                return 0;
+            case pieces::CliCommand::Build:
+                return handle_build(args);
+            case pieces::CliCommand::Pull:
+                return handle_pull(args);
+            case pieces::CliCommand::Run:
+                return handle_run(args);
+            case pieces::CliCommand::Images:
+                return handle_images();
+            case pieces::CliCommand::Ps:
+                return handle_ps(args);
+            case pieces::CliCommand::Stop: {
+                int rc = 0;
+                for (const auto& ident : args.containers) {
+                    if (pieces::stop_container(ident, args.timeout_sec) != 0) rc = 1;
+                }
+                return rc;
+            }
+            case pieces::CliCommand::Logs:
+                return pieces::show_container_logs(args.target_container, args.follow, args.tail_lines);
+            case pieces::CliCommand::Exec:
+                return pieces::exec_in_container(
+                    args.target_container, args.cmd_args, args.env_specs, args.workdir, args.allocate_tty);
+            case pieces::CliCommand::Stats:
+                return pieces::show_container_stats(args.target_container);
+            case pieces::CliCommand::Rm: {
+                for (const auto& ident : args.containers) {
+                    std::cout << "Removed container " << pieces::remove_container(ident, args.force) << "\n";
+                }
+                return 0;
+            }
+            case pieces::CliCommand::Rmi: {
+                for (const auto& img : args.images) {
+                    pieces::remove_image(img);
+                    std::cout << "Removed image " << img << "\n";
+                }
+                return 0;
+            }
+            case pieces::CliCommand::Prune: {
+                int removed = pieces::prune_unused_data();
+                std::cout << "Pruned " << removed << " unused container/cache item(s).\n";
+                return 0;
+            }
+            case pieces::CliCommand::OciSpec: {
+                auto spec_obj = pieces::generate_default_oci_spec_json(args.rootless);
+                std::ofstream out("config.json");
+                out << pieces::JsonValue(spec_obj).dump(2) << "\n";
+                std::cout << "Generated OCI config.json\n";
+                return 0;
+            }
+            case pieces::CliCommand::OciCreate:
+                return pieces::oci_create(
+                    args.target_container, args.oci_bundle, args.oci_pid_file, args.oci_state_root);
+            case pieces::CliCommand::OciStart:
+                return pieces::oci_start(args.target_container, args.oci_state_root);
+            case pieces::CliCommand::OciState:
+                return pieces::oci_print_state(args.target_container, args.oci_state_root);
+            case pieces::CliCommand::OciKill:
+                return pieces::oci_kill(args.target_container, args.oci_signal, args.oci_state_root);
+            case pieces::CliCommand::OciDelete:
+                return pieces::oci_delete(args.target_container, args.force, args.oci_state_root);
+        }
+    } catch (const std::exception& exc) {
+        std::cerr << "pieces: " << exc.what() << "\n";
+        return 1;
     }
     return 1;
 }

@@ -88,9 +88,7 @@ void ensure_dev_node(
     bool rootless) {
     std::string target = std::string("/dev/") + dev_name;
     std::error_code ec;
-    if (fs::exists(target, ec)) {
-        return;
-    }
+    if (fs::exists(target, ec)) return;
 
     if (!rootless) {
         if (::mknod(target.c_str(), S_IFCHR | 0666, makedev(maj, min)) == 0) {
@@ -116,9 +114,7 @@ void ensure_dev_node(
 void apply_bind_mounts(const fs::path& rootfs_real, const std::vector<VolumeMount>& volumes) {
     for (const auto& vol : volumes) {
         std::string rel = vol.container_path;
-        while (!rel.empty() && rel.front() == '/') {
-            rel.erase(rel.begin());
-        }
+        while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
         fs::path target = fs::weakly_canonical(rootfs_real / rel);
         auto relative_check = target.lexically_relative(rootfs_real);
         if (relative_check.empty() || (*relative_check.begin() == "..")) {
@@ -141,50 +137,66 @@ void apply_bind_mounts(const fs::path& rootfs_real, const std::vector<VolumeMoun
     }
 }
 
-void mask_sensitive_proc_and_sys_paths() {
+void mask_path_entry(const std::string& path) {
     std::error_code ec;
-    // Remount /proc/sys read-only
-    if (fs::exists("/proc/sys", ec)) {
-        if (::mount("/proc/sys", "/proc/sys", nullptr, MS_BIND | MS_REC, nullptr) == 0) {
-            ::mount(nullptr, "/proc/sys", nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
-        }
+    if (!fs::exists(path, ec)) return;
+    if (fs::is_directory(path, ec)) {
+        ::mount("tmpfs", path.c_str(), "tmpfs", MS_RDONLY, "mode=000");
+    } else {
+        ::mount("/dev/null", path.c_str(), nullptr, MS_BIND, nullptr);
     }
-    // Remount /sys read-only
+}
+
+void make_path_readonly(const std::string& path) {
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return;
+    if (::mount(path.c_str(), path.c_str(), nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+        ::mount(nullptr, path.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+    }
+}
+
+void mask_sensitive_proc_and_sys_paths(
+    const std::vector<std::string>& extra_masked_paths,
+    const std::vector<std::string>& extra_readonly_paths) {
+    std::error_code ec;
+    make_path_readonly("/proc/sys");
     if (fs::exists("/sys", ec)) {
         ::mount(nullptr, "/sys", nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
     }
+    for (const auto& rp : extra_readonly_paths) {
+        make_path_readonly(rp);
+    }
 
-    const char* masked_files[] = {
+    const char* default_masked[] = {
         "/proc/kcore",
         "/proc/keys",
         "/proc/timer_list",
         "/proc/sched_debug",
         "/proc/latency_stats",
-    };
-    for (const char* p : masked_files) {
-        if (fs::exists(p, ec)) {
-            ::mount("/dev/null", p, nullptr, MS_BIND, nullptr);
-        }
-    }
-
-    const char* masked_dirs[] = {
         "/proc/acpi",
         "/proc/scsi",
         "/sys/firmware",
     };
-    for (const char* d : masked_dirs) {
-        if (fs::is_directory(d, ec)) {
-            ::mount("tmpfs", d, "tmpfs", MS_RDONLY, "mode=000");
-        }
+    for (const char* p : default_masked) {
+        mask_path_entry(p);
     }
+    for (const auto& mp : extra_masked_paths) {
+        mask_path_entry(mp);
+    }
+}
+
+std::string format_id_mappings(const std::vector<IdMapping>& maps) {
+    std::ostringstream oss;
+    for (const auto& m : maps) {
+        oss << m.container_id << " " << m.host_id << " " << m.size << "\n";
+    }
+    return oss.str();
 }
 
 }  // namespace
 
 void unshare_namespaces(int flags) {
-    if (::unshare(flags) != 0) {
-        throw_errno("unshare");
-    }
+    if (::unshare(flags) != 0) throw_errno("unshare");
 }
 
 void checked_mount(
@@ -221,9 +233,7 @@ std::optional<SubIdRange> parse_subid_range(
     const std::string& subid_file_path,
     const std::string& username) {
     std::ifstream in(subid_file_path);
-    if (!in) {
-        return std::nullopt;
-    }
+    if (!in) return std::nullopt;
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -238,9 +248,7 @@ std::optional<SubIdRange> parse_subid_range(
             try {
                 uint32_t start = static_cast<uint32_t>(std::stoul(start_s));
                 uint32_t count = static_cast<uint32_t>(std::stoul(count_s));
-                if (count > 0) {
-                    return SubIdRange{start, count};
-                }
+                if (count > 0) return SubIdRange{start, count};
             } catch (const std::exception&) {
                 continue;
             }
@@ -251,22 +259,68 @@ std::optional<SubIdRange> parse_subid_range(
 
 void write_user_namespace_maps(
     const std::string& proc_dir_for_pid,
-    uid_t host_uid,
-    gid_t host_gid) {
+    const std::vector<IdMapping>& uid_maps,
+    const std::vector<IdMapping>& gid_maps) {
     fs::path proc_dir(proc_dir_for_pid);
     std::error_code ec;
     fs::path setgroups_path = proc_dir / "setgroups";
-    if (fs::exists(setgroups_path, ec)) {
+    if (fs::exists(setgroups_path, ec) && gid_maps.size() <= 1) {
         write_exact_file(setgroups_path, "deny");
     }
-    write_exact_file(proc_dir / "uid_map", "0 " + std::to_string(host_uid) + " 1\n");
-    write_exact_file(proc_dir / "gid_map", "0 " + std::to_string(host_gid) + " 1\n");
+    if (!uid_maps.empty()) {
+        write_exact_file(proc_dir / "uid_map", format_id_mappings(uid_maps));
+    }
+    if (!gid_maps.empty()) {
+        write_exact_file(proc_dir / "gid_map", format_id_mappings(gid_maps));
+    }
+}
+
+void write_user_namespace_maps(
+    const std::string& proc_dir_for_pid,
+    uid_t host_uid,
+    gid_t host_gid) {
+    write_user_namespace_maps(
+        proc_dir_for_pid,
+        {{0, static_cast<uint32_t>(host_uid), 1}},
+        {{0, static_cast<uint32_t>(host_gid), 1}});
 }
 
 void setup_rootless_user_namespace(
     pid_t target_pid,
     uid_t host_uid,
-    gid_t host_gid) {
+    gid_t host_gid,
+    const std::vector<IdMapping>& custom_uid_maps,
+    const std::vector<IdMapping>& custom_gid_maps) {
+    std::string proc_path = (target_pid == ::getpid())
+                                ? "/proc/self"
+                                : ("/proc/" + std::to_string(target_pid));
+
+    if (!custom_uid_maps.empty() || !custom_gid_maps.empty()) {
+        if (::geteuid() == 0) {
+            write_user_namespace_maps(proc_path, custom_uid_maps, custom_gid_maps);
+            return;
+        }
+        if (target_pid != ::getpid() && command_in_path("newuidmap") && command_in_path("newgidmap")) {
+            std::string pid_s = std::to_string(target_pid);
+            std::vector<std::string> uargs = {"newuidmap", pid_s};
+            for (const auto& m : custom_uid_maps) {
+                uargs.push_back(std::to_string(m.container_id));
+                uargs.push_back(std::to_string(m.host_id));
+                uargs.push_back(std::to_string(m.size));
+            }
+            std::vector<std::string> gargs = {"newgidmap", pid_s};
+            for (const auto& m : custom_gid_maps) {
+                gargs.push_back(std::to_string(m.container_id));
+                gargs.push_back(std::to_string(m.host_id));
+                gargs.push_back(std::to_string(m.size));
+            }
+            if ((custom_uid_maps.empty() || run_quiet_helper(uargs) == 0) &&
+                (custom_gid_maps.empty() || run_quiet_helper(gargs) == 0)) {
+                return;
+            }
+        }
+    }
+
     if (target_pid != ::getpid() && command_in_path("newuidmap") && command_in_path("newgidmap")) {
         struct passwd pwd{};
         struct passwd* res = nullptr;
@@ -286,17 +340,25 @@ void setup_rootless_user_namespace(
                     "0", std::to_string(host_gid), "1",
                     "1", std::to_string(subgid->start), std::to_string(subgid->count)
                 });
-                if (r1 == 0 && r2 == 0) {
-                    return;
-                }
+                if (r1 == 0 && r2 == 0) return;
             }
         }
     }
 
-    std::string proc_path = (target_pid == ::getpid())
-                                ? "/proc/self"
-                                : ("/proc/" + std::to_string(target_pid));
     write_user_namespace_maps(proc_path, host_uid, host_gid);
+}
+
+void join_namespace_path(const std::string& ns_path) {
+    int fd = ::open(ns_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw_errno("open(" + ns_path + ")");
+    }
+    int rc = ::setns(fd, 0);
+    int saved_err = errno;
+    ::close(fd);
+    if (rc != 0) {
+        throw std::system_error(saved_err, std::generic_category(), "setns(" + ns_path + ")");
+    }
 }
 
 void enter_container_namespaces(int target_pid) {
@@ -313,9 +375,7 @@ void enter_container_namespaces(int target_pid) {
         }
         int fd = ::open(ns_path.c_str(), O_RDONLY);
         if (fd < 0) {
-            if (std::strcmp(ns, "user") == 0 && errno == ENOENT) {
-                continue;
-            }
+            if (std::strcmp(ns, "user") == 0 && errno == ENOENT) continue;
             throw_errno("open(" + ns_path + ")");
         }
         int rc = ::setns(fd, 0);
@@ -348,9 +408,8 @@ VolumeMount parse_volume_spec(const std::string& spec) {
     const std::string& container_path = parts[1];
     bool read_only = false;
     if (parts.size() == 3) {
-        if (parts[2] == "ro") {
-            read_only = true;
-        } else if (parts[2] != "rw") {
+        if (parts[2] == "ro") read_only = true;
+        else if (parts[2] != "rw") {
             throw std::invalid_argument("Invalid volume mode '" + parts[2] + "'; expected 'ro' or 'rw'");
         }
     }
@@ -365,23 +424,112 @@ VolumeMount parse_volume_spec(const std::string& spec) {
     return {host_abs.string(), container_path, read_only};
 }
 
+void prepare_hybrid_tmpfs_rootfs(const fs::path& lower_real, const fs::path& merged_real) {
+    // Mount RAM tmpfs as writable top-level root inside container mount namespace (<0.1ms)
+    checked_mount("tmpfs", merged_real.c_str(), "tmpfs", 0, "mode=755");
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(lower_real, ec)) {
+        std::string name = entry.path().filename().string();
+        if (name == ".pieces_meta.json" || name == "old_root") continue;
+        fs::path dst = merged_real / name;
+
+        if (entry.is_symlink(ec)) {
+            fs::create_symlink(fs::read_symlink(entry.path(), ec), dst, ec);
+            continue;
+        }
+        if (!entry.is_directory(ec)) {
+            fs::copy_file(entry.path(), dst, fs::copy_options::overwrite_existing, ec);
+            continue;
+        }
+
+        if (name == "proc" || name == "sys" || name == "dev" ||
+            name == "tmp" || name == "run" || name == "mnt" || name == "srv") {
+            fs::create_directories(dst, ec);
+            if (name == "tmp") {
+                fs::permissions(dst, fs::perms::all | fs::perms::sticky_bit, ec);
+            }
+            continue;
+        }
+
+        if (name == "etc" || name == "home" || name == "root") {
+            fs::copy(
+                entry.path(),
+                dst,
+                fs::copy_options::recursive | fs::copy_options::copy_symlinks | fs::copy_options::overwrite_existing,
+                ec);
+            continue;
+        }
+
+        // Bind-mount large OS directories (usr, var, opt, boot, etc.) read-only (<0.1ms total, 0 files copied)
+        fs::create_directories(dst, ec);
+        checked_mount(entry.path().c_str(), dst.c_str(), nullptr, MS_BIND | MS_REC, nullptr);
+        ::mount(nullptr, dst.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+    }
+
+    // Ensure writable /var/tmp and /var/log on tmpfs even when /var is read-only bind-mounted
+    for (const char* wdir : {"var/tmp", "var/log"}) {
+        fs::path p = merged_real / wdir;
+        if (fs::is_directory(p, ec)) {
+            ::mount("tmpfs", p.c_str(), "tmpfs", 0, nullptr);
+        }
+    }
+}
+
+void mount_in_namespace_rootfs(const fs::path& rootfs_real, const OverlayRootfsSpec& spec) {
+    std::string opts = "lowerdir=" + spec.lower_dir +
+                       ",upperdir=" + spec.upper_dir +
+                       ",workdir=" + spec.work_dir;
+
+    if (::mount("overlay", rootfs_real.c_str(), "overlay", 0, opts.c_str()) == 0) {
+        return;
+    }
+
+    // Rootless Linux 5.11+ fallback: userxattr option allows unprivileged overlayfs
+    std::string uopts = opts + ",userxattr";
+    if (::mount("overlay", rootfs_real.c_str(), "overlay", 0, uopts.c_str()) == 0) {
+        return;
+    }
+
+    if (command_in_path("fuse-overlayfs") &&
+        run_quiet_helper({"fuse-overlayfs", "-o", opts, rootfs_real.c_str()}) == 0) {
+        return;
+    }
+
+    if (spec.full_copy) {
+        fs::copy(
+            spec.lower_dir,
+            rootfs_real,
+            fs::copy_options::recursive | fs::copy_options::copy_symlinks | fs::copy_options::overwrite_existing);
+        return;
+    }
+
+    prepare_hybrid_tmpfs_rootfs(fs::weakly_canonical(spec.lower_dir), rootfs_real);
+}
+
 void setup_container_mounts(
     const std::string& rootfs_dir,
     const std::vector<VolumeMount>& volumes,
     bool rootless,
-    bool harden_proc_sys) {
+    bool harden_proc_sys,
+    bool readonly_rootfs,
+    const std::vector<std::string>& extra_masked_paths,
+    const std::vector<std::string>& extra_readonly_paths,
+    const std::optional<OverlayRootfsSpec>& overlay_spec) {
     checked_mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
 
     fs::path rootfs_real = fs::weakly_canonical(fs::absolute(rootfs_dir));
+    if (overlay_spec.has_value()) {
+        mount_in_namespace_rootfs(rootfs_real, *overlay_spec);
+    }
+
     apply_bind_mounts(rootfs_real, volumes);
 
     checked_mount(rootfs_real.c_str(), rootfs_real.c_str(), "bind", MS_BIND | MS_REC, nullptr);
     fs::path old_root = rootfs_real / "old_root";
     fs::create_directories(old_root);
     pivot_root_dir(rootfs_real.string(), old_root.string());
-    if (::chdir("/") != 0) {
-        throw_errno("chdir(/)");
-    }
+    if (::chdir("/") != 0) throw_errno("chdir(/)");
 
     fs::create_directories("/proc");
     checked_mount("proc", "/proc", "proc", 0, nullptr);
@@ -424,12 +572,16 @@ void setup_container_mounts(
     }
 
     checked_umount2("/old_root", MNT_DETACH);
-    if (::rmdir("/old_root") != 0) {
-        throw_errno("rmdir(/old_root)");
-    }
+    if (::rmdir("/old_root") != 0) throw_errno("rmdir(/old_root)");
 
     if (harden_proc_sys) {
-        mask_sensitive_proc_and_sys_paths();
+        mask_sensitive_proc_and_sys_paths(extra_masked_paths, extra_readonly_paths);
+    }
+
+    if (readonly_rootfs) {
+        if (::mount(nullptr, "/", nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr) != 0) {
+            throw_errno("remount(/ readonly)");
+        }
     }
 }
 

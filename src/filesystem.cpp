@@ -17,11 +17,11 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <regex>
 #include <stdexcept>
 #include <system_error>
 
 #include "pieces/namespaces.hpp"
+#include "pieces/network.hpp"
 
 namespace fs = std::filesystem;
 
@@ -32,9 +32,8 @@ namespace {
 constexpr const char* DEFAULT_BUILD_PATH =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-const std::regex& valid_name_regex() {
-    static const std::regex kRegex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$");
-    return kRegex;
+bool is_valid_name_char(unsigned char c) {
+    return std::isalnum(c) != 0 || c == '.' || c == '_' || c == ':' || c == '-';
 }
 
 std::string strip_archive_suffix(const std::string& filename) {
@@ -345,7 +344,8 @@ std::string validate_name(const std::string& name, const std::string& kind) {
         name.find('\0') != std::string::npos) {
         throw std::invalid_argument("Invalid " + kind + " name '" + name + "': path separators are not allowed");
     }
-    if (!std::regex_match(name, valid_name_regex())) {
+    if (name.size() > 128 || !std::isalnum(static_cast<unsigned char>(name[0])) ||
+        !std::all_of(name.begin(), name.end(), [](unsigned char c) { return is_valid_name_char(c); })) {
         throw std::invalid_argument(
             "Invalid " + kind + " name '" + name +
             "': must start with an alphanumeric character and contain only [A-Za-z0-9._:-]");
@@ -699,6 +699,7 @@ bool build_image(
         }
         meta_out << JsonValue(runtime_meta).dump(2) << "\n";
         meta_out.close();
+        configure_container_dns_and_hosts(staging_dir, "pieces");
 
         fs::path backup_dir = parent_dir / (abs_image.filename().string() + ".old." + pid_str);
         fs::remove_all(backup_dir, ec);
@@ -823,40 +824,53 @@ int prune_unused_data(const std::string& containers_dir, const std::string& cach
 RootfsSetup prepare_container_rootfs(
     const std::string& image_path,
     const std::string& container_dir,
-    const std::string& hostname) {
-    fs::path cdir(container_dir);
-    fs::path upper_dir = cdir / "upper";
-    fs::path work_dir = cdir / "work";
-    fs::path merged_dir = cdir / "rootfs";
+    const std::string& /*hostname*/,
+    bool readonly_rootfs,
+    bool ephemeral_ram) {
+    std::string abs_image = fs::absolute(image_path).string();
+    // Zero-copy fast path for read-only containers: pivot directly onto image_path (remounted MS_RDONLY)
+    if (readonly_rootfs) {
+        return {abs_image, "", "", "readonly-bind"};
+    }
+
+    fs::path scratch_base = container_dir;
+    if (ephemeral_ram && fs::is_directory("/dev/shm")) {
+        scratch_base = fs::path("/dev/shm/.pieces-run") / fs::path(container_dir).filename();
+    }
+
+    fs::path upper_dir = fs::absolute(scratch_base / "upper");
+    fs::path work_dir = fs::absolute(scratch_base / "work");
+    fs::path merged_dir = fs::absolute(scratch_base / "rootfs");
     fs::create_directories(upper_dir);
     fs::create_directories(work_dir);
     fs::create_directories(merged_dir);
 
-    std::string opts = "lowerdir=" + fs::absolute(image_path).string() +
-                       ",upperdir=" + fs::absolute(upper_dir).string() +
-                       ",workdir=" + fs::absolute(work_dir).string();
-
-    if (::mount("overlay", merged_dir.c_str(), "overlay", 0, opts.c_str()) == 0) {
-        configure_container_dns_and_hosts(merged_dir, hostname);
-        return {merged_dir.string(), "overlay"};
-    }
-
-    std::error_code ec;
-    fs::remove_all(merged_dir, ec);
-    fs::copy(
-        image_path,
-        merged_dir,
-        fs::copy_options::recursive | fs::copy_options::copy_symlinks | fs::copy_options::overwrite_existing);
-    configure_container_dns_and_hosts(merged_dir, hostname);
-    return {merged_dir.string(), "copy"};
+    // Defer mounting OverlayFS (or hybrid tmpfs fallback) until inside the container's
+    // own mount/user namespace (pid2), enabling rootless kernel OverlayFS (<1ms) and
+    // zero host-side mount leaks or 500ms parent-side copies.
+    return {merged_dir.string(), upper_dir.string(), work_dir.string(), "in-ns-overlay"};
 }
 
 void cleanup_container_rootfs(const std::string& container_dir, const std::string& method) {
-    if (method == "overlay") {
-        fs::path merged_dir = fs::path(container_dir) / "rootfs";
-        if (fs::exists(merged_dir)) {
+    if (method == "readonly-bind") {
+        return;
+    }
+    fs::path cdir(container_dir);
+    fs::path ram_dir = fs::path("/dev/shm/.pieces-run") / cdir.filename();
+    std::error_code ec;
+    fs::path target_base = fs::exists(ram_dir, ec) ? ram_dir : cdir;
+    fs::path merged_dir = target_base / "rootfs";
+    if (fs::exists(merged_dir, ec)) {
+        if (method == "overlay") {
             ::umount2(merged_dir.c_str(), MNT_DETACH);
+        } else if (method == "fuse-overlay") {
+            if (run_host_cmd({"fusermount3", "-u", "-z", merged_dir.string()}, true) != 0) {
+                run_host_cmd({"fusermount", "-u", "-z", merged_dir.string()}, true);
+            }
         }
+    }
+    if (target_base == ram_dir) {
+        fs::remove_all(ram_dir, ec);
     }
 }
 

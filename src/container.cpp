@@ -1,6 +1,7 @@
 #include "pieces/container.hpp"
 
 #include <fcntl.h>
+#include <linux/seccomp.h>
 #include <poll.h>
 #include <pty.h>
 #include <sched.h>
@@ -29,6 +30,7 @@
 #include "pieces/cgroup.hpp"
 #include "pieces/namespaces.hpp"
 #include "pieces/network.hpp"
+#include "pieces/oci_runtime.hpp"
 #include "pieces/parser.hpp"
 #include "pieces/security.hpp"
 
@@ -59,15 +61,11 @@ struct TerminalRawGuard {
         if (::isatty(STDIN_FILENO) && ::tcgetattr(STDIN_FILENO, &orig) == 0) {
             struct termios raw = orig;
             ::cfmakeraw(&raw);
-            if (::tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
-                active = true;
-            }
+            if (::tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) active = true;
         }
     }
     ~TerminalRawGuard() {
-        if (active) {
-            ::tcsetattr(STDIN_FILENO, TCSANOW, &orig);
-        }
+        if (active) ::tcsetattr(STDIN_FILENO, TCSANOW, &orig);
     }
     TerminalRawGuard(const TerminalRawGuard&) = delete;
     TerminalRawGuard& operator=(const TerminalRawGuard&) = delete;
@@ -111,9 +109,7 @@ void relay_pty_session(int master_fd, int child_pid_for_signals) {
         struct pollfd fds[2];
         nfds_t nfds = 0;
         fds[nfds++] = {master_fd, POLLIN, 0};
-        if (stdin_open) {
-            fds[nfds++] = {STDIN_FILENO, POLLIN, 0};
-        }
+        if (stdin_open) fds[nfds++] = {STDIN_FILENO, POLLIN, 0};
 
         int prc = ::poll(fds, nfds, 100);
         if (prc < 0) {
@@ -186,9 +182,7 @@ std::vector<std::string> coerce_cmd_list(const JsonValue* val) {
         }
         return out;
     }
-    if (val->is_string()) {
-        return split_shell_words(val->as_string());
-    }
+    if (val->is_string()) return split_shell_words(val->as_string());
     return {};
 }
 
@@ -270,7 +264,6 @@ void reconcile_dead_container_resources(
         method = m->second.as_string();
     }
 
-    // Reconstruct network plan from persisted meta if present to tear down orphan rules/veth
     ContainerNetwork orphan_plan;
     if (auto hv = obj.find("host_veth"); hv != obj.end() && hv->second.is_string()) {
         orphan_plan.host_veth = hv->second.as_string();
@@ -281,13 +274,11 @@ void reconcile_dead_container_resources(
     if (auto ps = obj.find("ports"); ps != obj.end() && ps->second.is_array()) {
         for (const auto& p : ps->second.as_array()) {
             if (!p.is_string()) continue;
-            // Stored as "[host_ip:]host->cont/proto"
             std::string s = p.as_string();
             auto arrow = s.find("->");
             if (arrow != std::string::npos) {
                 try {
-                    orphan_plan.ports.push_back(parse_port_mapping(
-                        s.substr(0, arrow) + ":" + s.substr(arrow + 2)));
+                    orphan_plan.ports.push_back(parse_port_mapping(s.substr(0, arrow) + ":" + s.substr(arrow + 2)));
                 } catch (const std::exception&) {
                 }
             }
@@ -298,9 +289,7 @@ void reconcile_dead_container_resources(
     if (!orphan_plan.ports.empty() && !orphan_plan.container_ip.empty()) {
         cleanup_port_forwarding(orphan_plan);
     }
-    if (!orphan_plan.host_veth.empty()) {
-        cleanup_container_network(orphan_plan.host_veth);
-    }
+    if (!orphan_plan.host_veth.empty()) cleanup_container_network(orphan_plan.host_veth);
     release_container_ip(containers_dir, cid);
     CgroupManager cg(cid);
     cg.cleanup();
@@ -315,20 +304,56 @@ void drain_fd_to_rotating_log(int pipe_fd, RotatingLogWriter& writer) {
     char buf[4096];
     while (true) {
         ssize_t n = ::read(pipe_fd, buf, sizeof(buf));
-        if (n > 0) {
-            writer.write(buf, static_cast<size_t>(n));
-        } else if (n == 0) {
-            break;
-        } else if (errno != EINTR) {
-            break;
-        }
+        if (n > 0) writer.write(buf, static_cast<size_t>(n));
+        else if (n == 0) break;
+        else if (errno != EINTR) break;
     }
 }
+
+struct TimingEntry {
+    std::string phase;
+    double delta_ms{0.0};
+    double total_ms{0.0};
+};
+
+class StartupProfiler {
+public:
+    explicit StartupProfiler(bool enabled)
+        : enabled_(enabled),
+          start_(std::chrono::steady_clock::now()),
+          last_(start_) {}
+
+    void mark(const std::string& phase) {
+        if (!enabled_) return;
+        auto now = std::chrono::steady_clock::now();
+        double delta = std::chrono::duration<double, std::milli>(now - last_).count();
+        double total = std::chrono::duration<double, std::milli>(now - start_).count();
+        last_ = now;
+        entries_.push_back({phase, delta, total});
+    }
+
+    void print_report(std::ostream& out = std::cerr) const {
+        if (!enabled_ || entries_.empty()) return;
+        out << "\nTIMING: Startup phase breakdown:\n";
+        for (const auto& e : entries_) {
+            out << "  " << std::left << std::setw(32) << e.phase
+                << " +" << std::fixed << std::setprecision(2) << std::setw(8) << e.delta_ms << " ms"
+                << " (total " << std::setw(8) << e.total_ms << " ms)\n";
+        }
+    }
+
+private:
+    bool enabled_;
+    std::chrono::steady_clock::time_point start_;
+    std::chrono::steady_clock::time_point last_;
+    std::vector<TimingEntry> entries_;
+};
 
 int run_single_container_attempt(
     const ContainerRunConfig& config,
     const std::string& container_id,
     const std::string& hostname,
+    const std::string& image_path,
     const std::string& container_dir,
     const RootfsSetup& rootfs,
     const std::vector<std::string>& command,
@@ -336,11 +361,15 @@ int run_single_container_attempt(
     const std::string& workdir,
     const std::vector<VolumeMount>& volumes,
     const std::set<cap_value_t>& target_caps,
+    const std::optional<SeccompProgram>& prebuilt_seccomp,
+    const SecurityOptions& sec_opts,
+    const std::optional<UserSpec>& user_spec,
     const std::optional<ContainerNetwork>& net_plan,
     CgroupManager& cgroup_mgr,
-    bool rootless,
+    bool use_userns,
     JsonObject& meta_record,
-    int& notify_parent_fd) {
+    int& notify_parent_fd,
+    StartupProfiler& profiler) {
     uid_t host_uid = ::getuid();
     gid_t host_gid = ::getgid();
 
@@ -358,27 +387,26 @@ int run_single_container_attempt(
     int log_pipe[2]{-1, -1};
     int null_fd = -1;
     if (config.detach) {
-        if (::pipe(log_pipe) != 0) {
-            return 1;
-        }
+        if (::pipe(log_pipe) != 0) return 1;
         null_fd = ::open("/dev/null", O_RDONLY);
     }
 
     int ready_pipe[2]{-1, -1};
     int userns_done_pipe[2]{-1, -1};
     int go_pipe[2]{-1, -1};
-    if (::pipe(ready_pipe) != 0 || ::pipe(userns_done_pipe) != 0 || ::pipe(go_pipe) != 0) {
+    if (::pipe(ready_pipe) != 0 || ::pipe(go_pipe) != 0 ||
+        (use_userns && ::pipe(userns_done_pipe) != 0)) {
         if (pty_master >= 0) { ::close(pty_master); ::close(pty_slave); }
         if (log_pipe[0] >= 0) { ::close(log_pipe[0]); ::close(log_pipe[1]); }
         if (null_fd >= 0) ::close(null_fd);
+        if (ready_pipe[0] >= 0) { ::close(ready_pipe[0]); ::close(ready_pipe[1]); }
+        if (go_pipe[0] >= 0) { ::close(go_pipe[0]); ::close(go_pipe[1]); }
         return 1;
     }
 
     std::vector<std::string> env_entries;
     env_entries.reserve(env_map.size());
-    for (const auto& [k, v] : env_map) {
-        env_entries.push_back(k + "=" + v);
-    }
+    for (const auto& [k, v] : env_map) env_entries.push_back(k + "=" + v);
 
     pid_t pid1 = ::fork();
     if (pid1 < 0) {
@@ -386,14 +414,14 @@ int run_single_container_attempt(
         if (log_pipe[0] >= 0) { ::close(log_pipe[0]); ::close(log_pipe[1]); }
         if (null_fd >= 0) ::close(null_fd);
         ::close(ready_pipe[0]); ::close(ready_pipe[1]);
-        ::close(userns_done_pipe[0]); ::close(userns_done_pipe[1]);
+        if (use_userns) { ::close(userns_done_pipe[0]); ::close(userns_done_pipe[1]); }
         ::close(go_pipe[0]); ::close(go_pipe[1]);
         return 1;
     }
 
     if (pid1 == 0) {
         ::close(ready_pipe[0]);
-        ::close(userns_done_pipe[1]);
+        if (use_userns) ::close(userns_done_pipe[1]);
         ::close(go_pipe[1]);
         if (pty_master >= 0) ::close(pty_master);
         if (log_pipe[0] >= 0) ::close(log_pipe[0]);
@@ -401,21 +429,19 @@ int run_single_container_attempt(
 
         try {
             int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC;
-            if (rootless) ns_flags |= CLONE_NEWUSER;
+            if (use_userns) ns_flags |= CLONE_NEWUSER;
             unshare_namespaces(ns_flags);
 
-            // Notify parent of pid1 so parent can write subuid/subgid maps before pid2 is forked
-            std::string p1_msg = std::to_string(::getpid()) + "\n";
-            [[maybe_unused]] ssize_t pw = ::write(ready_pipe[1], p1_msg.data(), p1_msg.size());
-
-            char ubuf = 0;
-            [[maybe_unused]] ssize_t ur = ::read(userns_done_pipe[0], &ubuf, 1);
-            ::close(userns_done_pipe[0]);
+            if (use_userns) {
+                std::string p1_msg = std::to_string(::getpid()) + "\n";
+                [[maybe_unused]] ssize_t pw = ::write(ready_pipe[1], p1_msg.data(), p1_msg.size());
+                char ubuf = 0;
+                [[maybe_unused]] ssize_t ur = ::read(userns_done_pipe[0], &ubuf, 1);
+                ::close(userns_done_pipe[0]);
+            }
 
             pid_t pid2 = ::fork();
-            if (pid2 < 0) {
-                throw std::system_error(errno, std::generic_category(), "fork(pid2)");
-            }
+            if (pid2 < 0) throw std::system_error(errno, std::generic_category(), "fork(pid2)");
 
             if (pid2 == 0) {
                 ::close(ready_pipe[1]);
@@ -442,7 +468,24 @@ int run_single_container_attempt(
                     }
 
                     checked_sethostname(hostname);
-                    setup_container_mounts(rootfs.rootfs_dir, volumes, rootless, !config.privileged);
+                    if (net_plan.has_value()) {
+                        configure_container_netns_netlink(*net_plan);
+                    }
+                    std::optional<OverlayRootfsSpec> overlay_spec;
+                    if (rootfs.method == "in-ns-overlay") {
+                        overlay_spec = OverlayRootfsSpec{
+                            image_path, rootfs.upper_dir, rootfs.work_dir, config.full_copy};
+                    }
+                    setup_container_mounts(
+                        rootfs.rootfs_dir,
+                        volumes,
+                        use_userns,
+                        !config.privileged,
+                        config.readonly_rootfs,
+                        {},
+                        {},
+                        overlay_spec);
+
                     if (!workdir.empty() && workdir != "/") {
                         fs::create_directories(workdir);
                         if (::chdir(workdir.c_str()) != 0) {
@@ -450,23 +493,34 @@ int run_single_container_attempt(
                         }
                     }
 
+                    if (sec_opts.apparmor_profile.has_value()) {
+                        apply_apparmor_profile(*sec_opts.apparmor_profile);
+                    }
+                    if (sec_opts.selinux_label.has_value()) {
+                        apply_selinux_label(*sec_opts.selinux_label);
+                    }
+
                     if (!config.privileged) {
                         drop_capabilities_to_set(target_caps);
-                        apply_default_seccomp_filter();
+                        if (prebuilt_seccomp.has_value()) {
+                            apply_seccomp_program(*prebuilt_seccomp);
+                        }
+                    }
+
+                    if (user_spec.has_value()) {
+                        apply_process_user(user_spec->uid, user_spec->gid, {}, config.run_as_non_root);
+                    } else if (config.run_as_non_root) {
+                        apply_process_user(::getuid(), ::getgid(), {}, true);
                     }
 
                     std::vector<char*> argv_ptrs;
                     argv_ptrs.reserve(command.size() + 1);
-                    for (auto& arg : const_cast<std::vector<std::string>&>(command)) {
-                        argv_ptrs.push_back(arg.data());
-                    }
+                    for (auto& arg : const_cast<std::vector<std::string>&>(command)) argv_ptrs.push_back(arg.data());
                     argv_ptrs.push_back(nullptr);
 
                     std::vector<char*> env_ptrs;
                     env_ptrs.reserve(env_entries.size() + 1);
-                    for (auto& e : env_entries) {
-                        env_ptrs.push_back(e.data());
-                    }
+                    for (auto& e : env_entries) env_ptrs.push_back(e.data());
                     env_ptrs.push_back(nullptr);
 
                     ::execvpe(argv_ptrs[0], argv_ptrs.data(), env_ptrs.data());
@@ -498,15 +552,14 @@ int run_single_container_attempt(
             if (log_pipe[1] >= 0) ::close(log_pipe[1]);
             if (null_fd >= 0) ::close(null_fd);
             ::close(ready_pipe[1]);
-            ::close(userns_done_pipe[0]);
+            if (use_userns) ::close(userns_done_pipe[0]);
             ::close(go_pipe[0]);
             ::_exit(1);
         }
     }
 
-    // Parent/supervisor process
     ::close(ready_pipe[1]);
-    ::close(userns_done_pipe[0]);
+    if (use_userns) ::close(userns_done_pipe[0]);
     ::close(go_pipe[0]);
     if (pty_slave >= 0) ::close(pty_slave);
     if (log_pipe[1] >= 0) ::close(log_pipe[1]);
@@ -522,25 +575,29 @@ int run_single_container_attempt(
         return line;
     };
 
-    std::string p1_str = read_line_fd(ready_pipe[0]);
-    if (!p1_str.empty() && std::all_of(p1_str.begin(), p1_str.end(), [](unsigned char c) { return std::isdigit(c); })) {
-        if (rootless) {
+    if (use_userns) {
+        std::string p1_str = read_line_fd(ready_pipe[0]);
+        if (!p1_str.empty() && std::all_of(p1_str.begin(), p1_str.end(), ::isdigit)) {
             try {
                 setup_rootless_user_namespace(static_cast<pid_t>(std::stoi(p1_str)), host_uid, host_gid);
             } catch (const std::exception& exc) {
                 std::cerr << "USERNS: Warning: " << exc.what() << "\n";
             }
+            [[maybe_unused]] ssize_t uw = ::write(userns_done_pipe[1], "1", 1);
         }
+        ::close(userns_done_pipe[1]);
+        profiler.mark("unshare + userns map");
     }
-    [[maybe_unused]] ssize_t uw = ::write(userns_done_pipe[1], "1", 1);
-    ::close(userns_done_pipe[1]);
 
     std::string p2_str = read_line_fd(ready_pipe[0]);
     ::close(ready_pipe[0]);
 
     int grandchild_pid = 0;
-    if (!p2_str.empty() && std::all_of(p2_str.begin(), p2_str.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    if (!p2_str.empty() && std::all_of(p2_str.begin(), p2_str.end(), ::isdigit)) {
         grandchild_pid = std::stoi(p2_str);
+        if (!use_userns) {
+            profiler.mark("unshare + fork pid2");
+        }
         cgroup_mgr.setup(grandchild_pid);
         if (net_plan.has_value()) {
             if (!setup_container_network(grandchild_pid, *net_plan)) {
@@ -548,11 +605,15 @@ int run_single_container_attempt(
                 meta_record["ports"] = JsonArray{};
             }
         }
-        meta_record["pid"] = static_cast<int64_t>(grandchild_pid);
-        write_container_meta(container_dir, meta_record);
+        if (!config.auto_remove || config.detach) {
+            meta_record["pid"] = static_cast<int64_t>(grandchild_pid);
+            write_container_meta(container_dir, meta_record);
+        }
+        profiler.mark("cgroup + veth + port fwd");
+        [[maybe_unused]] ssize_t gw = ::write(go_pipe[1], "1", 1);
+    } else {
+        profiler.mark("child setup failed");
     }
-
-    [[maybe_unused]] ssize_t gw = ::write(go_pipe[1], "1", 1);
     ::close(go_pipe[1]);
 
     if (notify_parent_fd >= 0) {
@@ -579,6 +640,7 @@ int run_single_container_attempt(
     if (::waitpid(pid1, &status1, 0) >= 0) {
         exit_code = waitstatus_to_exitcode(status1);
     }
+    profiler.mark("container waitpid exit");
 
     if (net_plan.has_value()) {
         cleanup_port_forwarding(*net_plan);
@@ -593,6 +655,7 @@ int execute_container_supervisor(
     const std::string& container_id,
     const std::string& container_name,
     const std::string& hostname,
+    const std::string& image_path,
     const std::string& container_dir,
     const RootfsSetup& rootfs,
     const std::vector<std::string>& command,
@@ -600,59 +663,55 @@ int execute_container_supervisor(
     const std::string& workdir,
     const std::vector<VolumeMount>& volumes,
     const std::set<cap_value_t>& target_caps,
+    const std::optional<SeccompProgram>& prebuilt_seccomp,
+    const SecurityOptions& sec_opts,
+    const std::optional<UserSpec>& user_spec,
     std::optional<ContainerNetwork>& net_plan,
     CgroupManager& cgroup_mgr,
-    bool rootless,
+    bool use_userns,
     JsonObject& meta_record,
-    int notify_parent_fd) {
+    int notify_parent_fd,
+    StartupProfiler& profiler) {
     int exit_code = 1;
     int backoff_ms = 100;
 
     while (true) {
         exit_code = run_single_container_attempt(
-            config, container_id, hostname, container_dir, rootfs,
+            config, container_id, hostname, image_path, container_dir, rootfs,
             command, env_map, workdir, volumes, target_caps,
-            net_plan, cgroup_mgr, rootless, meta_record, notify_parent_fd);
+            prebuilt_seccomp, sec_opts, user_spec,
+            net_plan, cgroup_mgr, use_userns, meta_record, notify_parent_fd, profiler);
 
         std::error_code ec;
         bool stop_requested = fs::exists(fs::path(container_dir) / ".stop_requested", ec);
         bool should_restart = false;
         switch (config.restart_policy) {
-            case RestartPolicy::No:
-                should_restart = false;
-                break;
-            case RestartPolicy::OnFailure:
-                should_restart = !stop_requested && (exit_code != 0);
-                break;
+            case RestartPolicy::No: should_restart = false; break;
+            case RestartPolicy::OnFailure: should_restart = !stop_requested && (exit_code != 0); break;
             case RestartPolicy::Always:
-                should_restart = !stop_requested;
-                break;
-            case RestartPolicy::UnlessStopped:
-                should_restart = !stop_requested;
-                break;
+            case RestartPolicy::UnlessStopped: should_restart = !stop_requested; break;
         }
-
-        if (!should_restart) {
-            break;
-        }
+        if (!should_restart) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         backoff_ms = std::min(5000, backoff_ms * 2);
     }
 
-    if (net_plan.has_value()) {
-        release_container_ip(config.containers_dir, container_id);
-    }
+    if (net_plan.has_value()) release_container_ip(config.containers_dir, container_id);
     cleanup_container_rootfs(container_dir, rootfs.method);
 
     if (config.auto_remove) {
         std::error_code ec;
-        fs::remove_all(container_dir, ec);
+        if (fs::exists(container_dir, ec)) {
+            fs::remove_all(container_dir, ec);
+        }
     } else {
         meta_record["status"] = "exited";
         meta_record["pid"] = static_cast<int64_t>(0);
         meta_record["exit_code"] = static_cast<int64_t>(exit_code);
         write_container_meta(container_dir, meta_record);
     }
+    profiler.mark("cleanup");
+    profiler.print_report();
 
     if (!config.detach) {
         std::cout << "RUN: Container '" << container_name << "' exited with code " << exit_code << ".\n";
@@ -683,9 +742,7 @@ void RotatingLogWriter::rotate() {
     for (int idx = max_files_ - 1; idx >= 1; --idx) {
         std::string src = (idx == 1) ? base_path_ : (base_path_ + "." + std::to_string(idx - 1));
         std::string dst = base_path_ + "." + std::to_string(idx);
-        if (fs::exists(src, ec)) {
-            fs::rename(src, dst, ec);
-        }
+        if (fs::exists(src, ec)) fs::rename(src, dst, ec);
     }
     fd_ = ::open(base_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     current_bytes_ = 0;
@@ -693,9 +750,7 @@ void RotatingLogWriter::rotate() {
 
 void RotatingLogWriter::write(const char* data, std::size_t len) {
     if (fd_ < 0 || len == 0) return;
-    if (current_bytes_ + len > max_bytes_ && current_bytes_ > 0) {
-        rotate();
-    }
+    if (current_bytes_ + len > max_bytes_ && current_bytes_ > 0) rotate();
     std::size_t off = 0;
     while (off < len && fd_ >= 0) {
         ssize_t w = ::write(fd_, data + off, len - off);
@@ -709,9 +764,7 @@ void RotatingLogWriter::write(const char* data, std::size_t len) {
 }
 
 void RotatingLogWriter::flush() {
-    if (fd_ >= 0) {
-        ::fsync(fd_);
-    }
+    if (fd_ >= 0) ::fsync(fd_);
 }
 
 RestartPolicy parse_restart_policy(const std::string& spec) {
@@ -840,9 +893,7 @@ std::vector<JsonObject> list_containers(bool show_all, const std::string& contai
 
 std::string remove_container(const std::string& identifier, bool force, const std::string& containers_dir) {
     auto target_opt = find_container_dir(identifier, containers_dir);
-    if (!target_opt.has_value()) {
-        throw std::runtime_error("Container '" + identifier + "' not found");
-    }
+    if (!target_opt.has_value()) throw std::runtime_error("Container '" + identifier + "' not found");
     const std::string& target = *target_opt;
 
     if (auto meta = read_meta_object(fs::path(target) / "meta.json"); meta.has_value()) {
@@ -871,13 +922,9 @@ std::string remove_container(const std::string& identifier, bool force, const st
 
 int stop_container(const std::string& identifier, int timeout_sec, const std::string& containers_dir) {
     auto target_opt = find_container_dir(identifier, containers_dir);
-    if (!target_opt.has_value()) {
-        throw std::runtime_error("Container '" + identifier + "' not found");
-    }
+    if (!target_opt.has_value()) throw std::runtime_error("Container '" + identifier + "' not found");
     auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
-    if (!meta.has_value()) {
-        throw std::runtime_error("Container metadata missing for '" + identifier + "'");
-    }
+    if (!meta.has_value()) throw std::runtime_error("Container metadata missing for '" + identifier + "'");
     {
         std::ofstream marker(fs::path(*target_opt) / ".stop_requested");
     }
@@ -920,14 +967,10 @@ int show_container_logs(
     int tail_lines,
     const std::string& containers_dir) {
     auto target_opt = find_container_dir(identifier, containers_dir);
-    if (!target_opt.has_value()) {
-        throw std::runtime_error("Container '" + identifier + "' not found");
-    }
+    if (!target_opt.has_value()) throw std::runtime_error("Container '" + identifier + "' not found");
     fs::path log_path = fs::path(*target_opt) / "container.log";
     std::error_code ec;
-    if (!fs::is_regular_file(log_path, ec) && !follow) {
-        return 0;
-    }
+    if (!fs::is_regular_file(log_path, ec) && !follow) return 0;
 
     std::streamoff offset = 0;
     if (fs::is_regular_file(log_path, ec)) {
@@ -950,9 +993,7 @@ int show_container_logs(
     while (follow) {
         if (fs::is_regular_file(log_path, ec)) {
             auto cur_size = static_cast<std::streamoff>(fs::file_size(log_path, ec));
-            if (cur_size < offset) {
-                offset = 0;  // File rotated
-            }
+            if (cur_size < offset) offset = 0;
             if (cur_size > offset) {
                 std::ifstream in(log_path, std::ios::binary);
                 in.seekg(offset);
@@ -983,25 +1024,17 @@ int exec_in_container(
     const std::optional<std::string>& workdir,
     bool allocate_tty,
     const std::string& containers_dir) {
-    if (cmd_args.empty()) {
-        throw std::invalid_argument("exec requires a command to run inside the container");
-    }
+    if (cmd_args.empty()) throw std::invalid_argument("exec requires a command to run inside the container");
     auto target_opt = find_container_dir(identifier, containers_dir);
-    if (!target_opt.has_value()) {
-        throw std::runtime_error("Container '" + identifier + "' not found");
-    }
+    if (!target_opt.has_value()) throw std::runtime_error("Container '" + identifier + "' not found");
     auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
-    if (!meta.has_value()) {
-        throw std::runtime_error("Container metadata missing for '" + identifier + "'");
-    }
+    if (!meta.has_value()) throw std::runtime_error("Container metadata missing for '" + identifier + "'");
     auto pid_it = meta->find("pid");
     if (pid_it == meta->end() || !pid_it->second.is_int() || pid_it->second.as_int() <= 0) {
         throw std::runtime_error("Container '" + identifier + "' is not running");
     }
     int target_pid = static_cast<int>(pid_it->second.as_int());
-    if (!is_pid_alive(target_pid)) {
-        throw std::runtime_error("Container '" + identifier + "' process is not alive");
-    }
+    if (!is_pid_alive(target_pid)) throw std::runtime_error("Container '" + identifier + "' process is not alive");
 
     std::string hostname = identifier;
     if (auto hn = meta->find("name"); hn != meta->end() && hn->second.is_string()) {
@@ -1010,9 +1043,7 @@ int exec_in_container(
     auto env_map = build_container_env(*meta, env_specs, hostname);
     std::vector<std::string> env_entries;
     env_entries.reserve(env_map.size());
-    for (const auto& [k, v] : env_map) {
-        env_entries.push_back(k + "=" + v);
-    }
+    for (const auto& [k, v] : env_map) env_entries.push_back(k + "=" + v);
 
     enter_container_namespaces(target_pid);
 
@@ -1073,7 +1104,38 @@ int exec_in_container(
     return waitstatus_to_exitcode(status);
 }
 
+int show_container_stats(
+    const std::string& identifier,
+    const std::string& containers_dir,
+    const std::string& cgroup_root) {
+    std::string cid = identifier;
+    std::string cg_dir;
+    if (auto target_opt = find_container_dir(identifier, containers_dir); target_opt.has_value()) {
+        cid = fs::path(*target_opt).filename().string();
+        cg_dir = (fs::path(cgroup_root) / "pieces" / cid).string();
+    } else {
+        auto state_obj = oci_get_state(identifier);
+        if (auto it = state_obj.find("cgroupsPath"); it != state_obj.end() && it->second.is_string()) {
+            cg_dir = it->second.as_string();
+        }
+    }
+
+    CgroupStats st = read_cgroup_stats(cg_dir);
+    JsonObject out;
+    out["id"] = cid;
+    out["memoryCurrentBytes"] = static_cast<int64_t>(st.memory_current_bytes);
+    out["memoryMaxBytes"] = static_cast<int64_t>(st.memory_max_bytes);
+    out["cpuUsageUsec"] = static_cast<int64_t>(st.cpu_usage_usec);
+    out["pidsCurrent"] = static_cast<int64_t>(st.pids_current);
+    out["pidsMax"] = static_cast<int64_t>(st.pids_max);
+    std::cout << JsonValue(out).dump(2) << "\n";
+    return 0;
+}
+
 int run_container(const ContainerRunConfig& config) {
+    ::signal(SIGPIPE, SIG_IGN);
+    StartupProfiler profiler(config.timing && !config.detach);
+
     std::string image_path = resolve_image_path(config.image, config.image_dir);
     if (!fs::is_directory(image_path)) {
         std::cerr << "Error: Image '" << config.image << "' not found. Did you build it first?\n";
@@ -1112,32 +1174,62 @@ int run_container(const ContainerRunConfig& config) {
     ports.reserve(config.port_specs.size());
     for (const auto& ps : config.port_specs) ports.push_back(parse_port_mapping(ps));
 
+    std::optional<UserSpec> user_spec;
+    if (config.user_spec.has_value()) {
+        user_spec = parse_user_spec(*config.user_spec);
+    }
+    if (config.run_as_non_root && (!user_spec.has_value() || user_spec->uid == 0)) {
+        throw std::invalid_argument("--run-as-non-root requires a non-zero --user UID[:GID]");
+    }
+
+    SecurityOptions sec_opts = parse_security_opts(config.security_opts);
+
+    std::optional<SeccompProgram> prebuilt_seccomp;
+    if (!config.privileged) {
+        if (config.seccomp_profile.has_value()) {
+            prebuilt_seccomp = load_seccomp_profile_file(*config.seccomp_profile);
+        } else {
+            prebuilt_seccomp = build_allowlist_seccomp_filter(
+                default_allowed_syscalls(),
+                SECCOMP_RET_ERRNO | (EPERM & 0x0000FFFFU));
+        }
+    }
+
     std::set<cap_value_t> target_caps;
     if (!config.privileged) {
         target_caps = compute_target_capabilities(config.cap_add, config.cap_drop);
     }
+    profiler.mark("config + seccomp + caps prep");
 
-    bool rootless = config.rootless || (::geteuid() != 0);
+    bool use_userns = config.rootless || (::geteuid() != 0);
+    bool host_is_root = (::geteuid() == 0);
     CgroupManager cgroup_mgr(container_id, config.memory_limit, config.cpu_limit, config.pids_limit);
 
     std::optional<ContainerNetwork> net_plan;
     if (config.network_mode == "bridge") {
-        if (rootless) {
+        if (!host_is_root) {
             if (!ports.empty()) {
                 std::cerr << "NETWORK: Warning: -p port forwarding requires root/CAP_NET_ADMIN; skipped in rootless mode.\n";
             }
-        } else if (setup_host_network()) {
+        } else if (setup_host_network(DEFAULT_BRIDGE, DEFAULT_BRIDGE_CIDR, DEFAULT_SUBNET_CIDR, true, config.isolate_net)) {
             net_plan = build_network_plan(container_id, config.containers_dir, ports);
         }
     }
+    profiler.mark("host network + IPAM");
 
     if (!config.detach) {
         std::cout << "RUN: Starting container '" << container_name << "' (" << container_id
-                  << ") from '" << config.image << "'" << (rootless ? " [rootless]" : "") << "...\n"
+                  << ") from '" << config.image << "'" << (use_userns ? " [userns]" : "") << "...\n"
                   << std::flush;
     }
 
-    RootfsSetup rootfs = prepare_container_rootfs(image_path, container_dir, hostname);
+    RootfsSetup rootfs = prepare_container_rootfs(
+        image_path,
+        container_dir,
+        hostname,
+        config.readonly_rootfs,
+        config.auto_remove && !config.detach);
+    profiler.mark("rootfs (" + rootfs.method + ")");
 
     JsonArray port_arr;
     if (net_plan.has_value()) {
@@ -1155,18 +1247,22 @@ int run_container(const ContainerRunConfig& config) {
     meta_record["host_veth"] = net_plan.has_value() ? net_plan->host_veth : "";
     meta_record["ports"] = std::move(port_arr);
     meta_record["restart_policy"] = restart_policy_to_string(config.restart_policy);
-    meta_record["rootless"] = rootless;
+    meta_record["rootless"] = use_userns;
+    meta_record["readonly_rootfs"] = config.readonly_rootfs;
     meta_record["rootfs_method"] = rootfs.method;
     meta_record["created_at"] = utc_timestamp_iso();
     meta_record["exit_code"] = nullptr;
-    write_container_meta(container_dir, meta_record);
+    if (!config.auto_remove || config.detach) {
+        write_container_meta(container_dir, meta_record);
+    }
 
     if (!config.detach) {
         int dummy_fd = -1;
         return execute_container_supervisor(
-            config, container_id, container_name, hostname, container_dir, rootfs,
-            command, env_map, workdir, volumes, target_caps, net_plan, cgroup_mgr,
-            rootless, meta_record, dummy_fd);
+            config, container_id, container_name, hostname, image_path, container_dir, rootfs,
+            command, env_map, workdir, volumes, target_caps,
+            prebuilt_seccomp, sec_opts, user_spec,
+            net_plan, cgroup_mgr, use_userns, meta_record, dummy_fd, profiler);
     }
 
     int sup_pipe[2]{-1, -1};
@@ -1196,9 +1292,10 @@ int run_container(const ContainerRunConfig& config) {
         }
         int notify_fd = sup_pipe[1];
         int rc = execute_container_supervisor(
-            config, container_id, container_name, hostname, container_dir, rootfs,
-            command, env_map, workdir, volumes, target_caps, net_plan, cgroup_mgr,
-            rootless, meta_record, notify_fd);
+            config, container_id, container_name, hostname, image_path, container_dir, rootfs,
+            command, env_map, workdir, volumes, target_caps,
+            prebuilt_seccomp, sec_opts, user_spec,
+            net_plan, cgroup_mgr, use_userns, meta_record, notify_fd, profiler);
         ::_exit(rc);
     }
 
