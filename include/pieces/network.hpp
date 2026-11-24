@@ -37,7 +37,11 @@ bool setup_host_network(
     const std::string& subnet_cidr = DEFAULT_SUBNET_CIDR,
     bool enable_nat = true);
 
-[[nodiscard]] std::string allocate_container_ip(const std::string& containers_dir);
+[[nodiscard]] std::string allocate_container_ip(
+    const std::string& containers_dir,
+    const std::string& owner_id = "");
+void release_container_ip(const std::string& containers_dir, const std::string& owner_id);
+
 [[nodiscard]] ContainerNetwork build_network_plan(
     const std::string& container_id,
     const std::string& containers_dir,

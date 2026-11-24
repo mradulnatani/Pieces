@@ -118,6 +118,8 @@ void default_curl_download(const std::string& url, const std::string& dest_path)
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -196,7 +198,7 @@ int default_run_build_step(
             }
             unshare_namespaces(ns_flags);
             if (rootless) {
-                write_user_namespace_maps("/proc/self", host_uid, host_gid);
+                setup_rootless_user_namespace(::getpid(), host_uid, host_gid);
             }
 
             pid_t pid2 = ::fork();
@@ -205,7 +207,7 @@ int default_run_build_step(
             }
             if (pid2 == 0) {
                 try {
-                    setup_container_mounts(rootfs_dir, {}, rootless);
+                    setup_container_mounts(rootfs_dir, {}, rootless, false);
                     if (!workdir.empty() && workdir != "/") {
                         fs::create_directories(workdir);
                         if (::chdir(workdir.c_str()) != 0) {
@@ -276,9 +278,57 @@ bool handle_oci_whiteout_entry(const fs::path& dest_real, const std::string& rel
     return false;
 }
 
+void fetch_tarball_with_cache(
+    const std::string& url,
+    const std::string& dest_tar,
+    const std::optional<std::string>& expected_sha256,
+    const DownloadFn& dl,
+    bool no_cache,
+    const std::string& cache_dir) {
+    std::error_code ec;
+    fs::create_directories(cache_dir, ec);
+    std::string cache_key = sha256_string(url);
+    fs::path cached_file = fs::path(cache_dir) / (cache_key + ".tar");
+
+    if (!no_cache && fs::is_regular_file(cached_file, ec)) {
+        bool valid = true;
+        if (expected_sha256.has_value()) {
+            valid = (sha256_file(cached_file.string()) == *expected_sha256);
+        }
+        if (valid) {
+            std::cout << "BUILD: Using cached tarball (" << cache_key.substr(0, 12) << ")\n";
+            fs::copy_file(cached_file, dest_tar, fs::copy_options::overwrite_existing);
+            return;
+        }
+        fs::remove(cached_file, ec);
+    }
+
+    std::cout << "BUILD: Downloading from " << url << "...\n";
+    dl(url, dest_tar);
+
+    if (expected_sha256.has_value()) {
+        std::string actual = sha256_file(dest_tar);
+        if (actual != *expected_sha256) {
+            throw std::runtime_error(
+                "SHA-256 verification failed for '" + url + "': expected " + *expected_sha256 + ", got " + actual);
+        }
+        std::cout << "BUILD: Verified SHA-256 checksum (" << actual.substr(0, 12) << "...)\n";
+    }
+
+    // Store in cache atomically
+    fs::path tmp_cache = fs::path(cache_dir) / (".tmp-" + cache_key + "-" + std::to_string(::getpid()));
+    if (fs::copy_file(dest_tar, tmp_cache, fs::copy_options::overwrite_existing, ec)) {
+        fs::rename(tmp_cache, cached_file, ec);
+        if (ec) {
+            fs::remove(tmp_cache, ec);
+        }
+    }
+}
+
 }  // namespace
 
 const std::map<std::string, std::string>& known_images() {
+    // Official upstream Linux distribution rootfs CDNs (no Docker Hub)
     static const std::map<std::string, std::string> kImages = {
         {"alpine:3.18", "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-minirootfs-3.18.3-x86_64.tar.gz"},
         {"fedora:38", "https://archives.fedoraproject.org/pub/fedora/linux/releases/38/Container/x86_64/images/Fedora-Container-Base-38-1.6.x86_64.tar.gz"},
@@ -308,10 +358,14 @@ std::string derive_image_name(const PiecefileSpec& spec, const std::string& tag)
     if (!tag.empty()) {
         raw = tag;
     } else if (spec.from_image.has_value()) {
-        try {
-            raw = parse_image_reference(*spec.from_image).default_local_name();
-        } catch (const std::exception&) {
+        if (known_images().contains(*spec.from_image)) {
             raw = *spec.from_image;
+        } else {
+            try {
+                raw = parse_image_reference(*spec.from_image).default_local_name();
+            } catch (const std::exception&) {
+                raw = *spec.from_image;
+            }
         }
     } else if (spec.from_url.has_value()) {
         std::string url = *spec.from_url;
@@ -501,7 +555,9 @@ bool build_image(
     const std::string& context_dir,
     const DownloadFn& downloader,
     const RunStepFn& run_step_fn,
-    const HttpGetFn& registry_http_get) {
+    const HttpGetFn& registry_http_get,
+    bool no_cache,
+    const std::string& cache_dir) {
     fs::path abs_image = fs::absolute(image_path);
     fs::path parent_dir = abs_image.parent_path();
     fs::create_directories(parent_dir);
@@ -514,15 +570,15 @@ bool build_image(
     fs::remove(tmp_tar, ec);
 
     try {
+        DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
+
         if (spec.from_url.has_value()) {
             const std::string& url = *spec.from_url;
             if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
                 throw std::invalid_argument("Unsupported URL scheme in '" + url + "'. Use http or https.");
             }
             fs::create_directories(staging_dir);
-            std::cout << "BUILD: Downloading from " << url << "...\n";
-            DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
-            dl(url, tmp_tar.string());
+            fetch_tarball_with_cache(url, tmp_tar.string(), spec.sha256, dl, no_cache, cache_dir);
             std::cout << "BUILD: Unpacking base rootfs...\n";
             safe_extract_tar_file(tmp_tar.string(), staging_dir.string());
             fs::remove(tmp_tar, ec);
@@ -530,9 +586,7 @@ bool build_image(
             auto it = known_images().find(*spec.from_image);
             if (it != known_images().end() && !registry_http_get) {
                 fs::create_directories(staging_dir);
-                std::cout << "BUILD: Downloading from " << it->second << "...\n";
-                DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
-                dl(it->second, tmp_tar.string());
+                fetch_tarball_with_cache(it->second, tmp_tar.string(), spec.sha256, dl, no_cache, cache_dir);
                 std::cout << "BUILD: Unpacking base rootfs...\n";
                 safe_extract_tar_file(tmp_tar.string(), staging_dir.string());
                 fs::remove(tmp_tar, ec);
@@ -545,7 +599,6 @@ bool build_image(
             throw std::invalid_argument("Piecefile has neither FROM nor FROM_URL.");
         }
 
-        // Load base image metadata if present (e.g., from OCI config)
         JsonObject runtime_meta;
         std::map<std::string, std::string> build_env;
         std::string build_workdir = "/";
@@ -574,16 +627,9 @@ bool build_image(
 
         RunStepFn exec_run = run_step_fn ? run_step_fn : RunStepFn(default_run_build_step);
 
-        // Replay Piecefile instructions in exact order
         if (!spec.instructions.empty()) {
             for (const auto& inst : spec.instructions) {
                 if (inst.keyword == "ENV") {
-                    for (const auto& [k, v] : spec.env) {
-                        // spec.env holds merged values; parse per-instruction from spec or update from inst
-                        (void)k;
-                        (void)v;
-                    }
-                    // Parse this single ENV instruction cleanly via parse_piecefile's public helper or split
                     auto tokens = split_shell_words(inst.value);
                     if (!tokens.empty() && tokens[0].find('=') != std::string::npos) {
                         for (const auto& tok : tokens) {
@@ -623,7 +669,6 @@ bool build_image(
             apply_copies(spec.copies, context_dir, staging_dir.string());
         }
 
-        // Merge final Piecefile metadata over base image metadata
         for (const auto& [k, v] : spec.env) {
             build_env[k] = v;
         }
@@ -731,6 +776,48 @@ void remove_image(const std::string& image_name, const std::string& image_dir) {
         throw std::runtime_error("Image '" + image_name + "' not found");
     }
     fs::remove_all(target);
+}
+
+int prune_unused_data(const std::string& containers_dir, const std::string& cache_dir) {
+    int removed = 0;
+    std::error_code ec;
+    if (fs::is_directory(containers_dir, ec)) {
+        for (const auto& entry : fs::directory_iterator(containers_dir, ec)) {
+            if (!entry.is_directory(ec)) continue;
+            fs::path meta_path = entry.path() / "meta.json";
+            bool is_running = false;
+            if (fs::is_regular_file(meta_path, ec)) {
+                std::ifstream in(meta_path);
+                if (in) {
+                    std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    try {
+                        JsonValue v = JsonValue::parse(s);
+                        if (const JsonValue* st = v.find("status"); st && st->is_string() && st->as_string() == "running") {
+                            if (const JsonValue* pid_v = v.find("pid"); pid_v && pid_v->is_int() && pid_v->as_int() > 0) {
+                                int pid = static_cast<int>(pid_v->as_int());
+                                if (::kill(pid, 0) == 0 || errno == EPERM) {
+                                    is_running = true;
+                                }
+                            }
+                        }
+                    } catch (const std::exception&) {
+                    }
+                }
+            }
+            if (!is_running) {
+                cleanup_container_rootfs(entry.path().string(), "overlay");
+                fs::remove_all(entry.path(), ec);
+                ++removed;
+            }
+        }
+    }
+    if (fs::is_directory(cache_dir, ec)) {
+        for (const auto& entry : fs::directory_iterator(cache_dir, ec)) {
+            fs::remove_all(entry.path(), ec);
+            ++removed;
+        }
+    }
+    return removed;
 }
 
 RootfsSetup prepare_container_rootfs(

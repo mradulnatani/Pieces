@@ -15,6 +15,7 @@ namespace pieces {
 inline constexpr const char* PIECES_DIR = ".pieces";
 inline constexpr const char* IMAGE_DIR = ".pieces/images";
 inline constexpr const char* CONTAINERS_DIR = ".pieces/containers";
+inline constexpr const char* CACHE_DIR = ".pieces/cache";
 
 struct ImageInfo {
     std::string name;
@@ -54,10 +55,13 @@ void apply_copies(
     const std::string& context_dir = ".",
     const DownloadFn& downloader = nullptr,
     const RunStepFn& run_step_fn = nullptr,
-    const HttpGetFn& registry_http_get = nullptr);
+    const HttpGetFn& registry_http_get = nullptr,
+    bool no_cache = false,
+    const std::string& cache_dir = CACHE_DIR);
 
 [[nodiscard]] std::vector<ImageInfo> list_images(const std::string& image_dir = IMAGE_DIR);
 void remove_image(const std::string& image_name, const std::string& image_dir = IMAGE_DIR);
+int prune_unused_data(const std::string& containers_dir = CONTAINERS_DIR, const std::string& cache_dir = CACHE_DIR);
 
 [[nodiscard]] RootfsSetup prepare_container_rootfs(
     const std::string& image_path,

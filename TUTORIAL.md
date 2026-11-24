@@ -1,23 +1,22 @@
-# Pieces Tutorial: Getting Started & Project Integration Guide
+# Pieces Tutorial: Production-Oriented Guide & Integration
 
-This tutorial walks you through compiling, configuring, and operating **Pieces** (written in C++20) to containerize and run full application projects.
+This tutorial explains how to compile, secure, operate, and integrate **Pieces** (C++20) into your projects without relying on Docker Hub.
 
 ---
 
 ## 1. Prerequisites & Build
 
-Pieces compiles to a native Linux binary (`./build/pieces`) using CMake, a C++20 compiler, `libcurl`, and `libarchive`.
-
-Verify host tools:
+Verify host dependencies:
 
 ```bash
 g++ --version              # C++20 compiler
 cmake --version            # CMake 3.20+
-which ip nsenter iptables  # iproute2, util-linux, iptables (for NAT and -p port forwarding)
+pkg-config --modversion libcurl libarchive openssl libcap
+which ip nsenter iptables  # iproute2, util-linux, iptables
 ls /sys/fs/cgroup/cgroup.controllers  # cgroups v2 check
 ```
 
-Compile Pieces and run the test suite:
+Compile and run unit tests:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -27,131 +26,98 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## 2. Step-by-Step Walkthrough
+## 2. Image Sources (Without Docker Hub)
 
-### Step 1: Pull Any OCI / Docker Hub Image (Optional)
+Docker Hub (`docker.io` / `registry-1.docker.io`) is intentionally blocked. You have three supported image sources:
 
-You can pull official or custom OCI images directly from Docker Hub or any OCI registry (`ghcr.io`, `localhost:5000`, etc.):
+1. **Built-in official distro rootfs tarballs:** `alpine:3.18`, `fedora:38`, `ubuntu:22.04`
+2. **Any tarball URL (`FROM_URL`) with optional checksum (`SHA256`)**
+3. **Any non-Docker-Hub OCI registry (`ghcr.io`, `quay.io`, `registry.fedoraproject.org`, or private `localhost:5000`)**
 
 ```bash
-./build/pieces pull alpine:3.18
-./build/pieces pull python:3.12-alpine -t py312
+# Pull from a non-Docker-Hub OCI registry (all blobs verified via SHA-256)
+./build/pieces pull ghcr.io/your-org/base-runtime:1.0 -t base-rt
 ./build/pieces images
 ```
 
 ---
 
-### Step 2: Create a `Piecefile` and Build Your Project
+## 3. Building Project Images (`Piecefile`)
 
-Create a `Piecefile` in your project root. Instructions (`ENV`, `WORKDIR`, `COPY`, `RUN`) execute **in exact order**:
+Instructions (`ENV`, `WORKDIR`, `COPY`, `RUN`) execute **in declaration order**:
 
 ```dockerfile
-# Pulls from built-in rootfs or any OCI/Docker Hub image
-FROM python:3.12-alpine
+FROM alpine:3.18
+# Optional integrity pin when using FROM_URL:
+# FROM_URL https://example.com/rootfs.tar.gz
+# SHA256 0123456789abcdef...
 
-ENV PYTHONDONTWRITEBYTECODE=1 PORT=8000
+ENV APP_ENV=production PORT=8000
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY ./requirements.txt /app/requirements.txt
+RUN apk add --no-cache python3 py3-pip && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
-CMD ["python", "-m", "http.server", "8000"]
+CMD ["python3", "app.py"]
 ```
 
-Build the image:
+Build the image (uses `.pieces/cache` automatically; pass `--no-cache` to bypass):
 
 ```bash
-sudo ./build/pieces build . --tag my-web-app
+sudo ./build/pieces build . --tag my-service
 ```
-
-> [!NOTE]
-> Build-time `RUN` executes inside an isolated namespace rooted at the staging rootfs with host DNS (`/etc/resolv.conf`). Unprivileged `RUN` builds use `CLONE_NEWUSER` automatically when kernel user namespaces are enabled; root builds work with standard privileges.
-
-#### Available `Piecefile` Instructions
-
-| Instruction | Example | Notes |
-| --- | --- | --- |
-| `FROM` | `FROM python:3.12-alpine` | Uses built-in tarballs (`alpine:3.18`, `fedora:38`, `ubuntu:22.04`) or pulls from OCI/Docker Hub. |
-| `FROM_URL` | `FROM_URL https://.../rootfs.tar.gz` | Downloads any HTTP/HTTPS Linux rootfs tarball via `libcurl`. |
-| `ENV` | `ENV FOO=bar BAZ="hello"` | Sets build-time and runtime env vars. |
-| `WORKDIR` | `WORKDIR /app` | Creates and switches to the working directory for subsequent `RUN` and container `CMD`. |
-| `COPY` | `COPY ./src /app/src` | Copies files/dirs from the build context into the image safely. |
-| `RUN` | `RUN apk add --no-cache curl` | Executes `/bin/sh -c <cmd>` inside the staging rootfs during `build`. |
-| `ENTRYPOINT` | `ENTRYPOINT ["/bin/sh", "-c"]` | Fixed executable prefix; CLI args are appended to it. |
-| `CMD` | `CMD ["python", "app.py"]` | Default command/args (supports shell string or JSON array). |
 
 ---
 
-### Step 3: Run Containers (Foreground, Detached, Port Mapping, Rootless)
+## 4. Running Production-Style Services
 
-#### Detached Service with Port Publishing (`-d`, `-p`)
+### Detached Service with Port Forwarding, Restart Policy, Log Rotation & Limits
 
 ```bash
 sudo ./build/pieces run -d \
   --name web \
   -p 8080:8000 \
+  --restart unless-stopped \
+  --log-max-size 10m \
+  --log-max-files 3 \
   --memory 256m \
   --cpus 0.5 \
   --pids-max 64 \
-  my-web-app
+  my-service
 ```
 
-- `-d` / `--detach`: Runs the container in the background, logs stdout/stderr to `.pieces/containers/<id>/container.log`, and prints the container ID.
-- `-p` / `--publish`: Forwards host port `8080` to container port `8000` (`[HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`) via `iptables` DNAT rules and cleans them up automatically on exit.
-
-#### Inspect, View Logs, and Exec into Running Containers
+### Interactive TTY Shell (`-it`)
 
 ```bash
-# List running or all containers (shows IP and published PORTS)
-./build/pieces ps
+sudo ./build/pieces run --rm -it alpine-3.18 /bin/sh
+```
+
+### Inspect, Logs, Exec, Stop & Prune
+
+```bash
 ./build/pieces ps -a
-
-# View or follow container logs
-./build/pieces logs -n 50 web
-./build/pieces logs -f web
-
-# Execute a command inside the running container's namespaces
-sudo ./build/pieces exec web /bin/sh -c "ps aux && ls -la /app"
-```
-
-#### Interactive Foreground Run & Volume Mounts (`-v`)
-
-```bash
-sudo ./build/pieces run --rm \
-  -v "$PWD/data:/data:ro" \
-  -e APP_ENV=staging \
-  my-web-app /bin/sh
-```
-
-#### Rootless Mode (Without `sudo`)
-
-When running as a non-root user (or with `--rootless`), Pieces automatically enables `CLONE_NEWUSER` and maps container UID/GID `0` to your host user in `uid_map`/`gid_map`:
-
-```bash
-./build/pieces run --rm --net none alpine-3.18 /bin/sh -c "id && uname -a"
-```
-
-> [!NOTE]
-> Host bridge `veth` creation and `-p` `iptables` forwarding require host `CAP_NET_ADMIN` (`sudo`); in rootless mode, container filesystem/PID/mount/UTS/IPC isolation still operates without `sudo`.
-
----
-
-### Step 4: Stop & Clean Up
-
-```bash
-sudo ./build/pieces stop web        # Sends SIGTERM, then SIGKILL after timeout (-t)
-./build/pieces rm web               # Removes stopped container (use -f to force)
-./build/pieces rmi my-web-app       # Removes image
+./build/pieces logs -n 50 -f web
+sudo ./build/pieces exec -it web /bin/sh
+sudo ./build/pieces stop -t 10 web
+./build/pieces rm web
+./build/pieces prune
 ```
 
 ---
 
-## 3. Troubleshooting
+## 5. Security Hardening & Rootless Mode
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `unshare: Operation not permitted` / `ENOSYS` | Kernel user namespaces disabled or blocked by host sandbox | Run with `sudo` or enable `kernel.unprivileged_userns_clone=1`. |
-| `PULL: Manifest fetch failed` | No internet access or invalid image ref/tag | Verify registry connectivity and `repo:tag` spelling. |
-| `NETWORK: Warning: -p port forwarding requires root` | Running rootless with `-p` | Run with `sudo ./build/pieces run ... -p ...`. |
-| `CGROUP: Warning: cgroup v2 not detected` | Host lacks cgroup v2 at `/sys/fs/cgroup` | Container runs without limits; mount cgroup v2 unified hierarchy if limits are needed. |
+- **Default container hardening:** Drops dangerous Linux capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_NET_ADMIN`, etc.), applies a `seccomp-bpf` filter (`PR_SET_NO_NEW_PRIVS`) blocking high-risk syscalls (`kexec_load`, `init_module`, `bpf`, `ptrace`, `mount`, `reboot`, etc.), mounts `/sys` and `/proc/sys` read-only, and masks `/proc/kcore`, `/proc/keys`, `/sys/firmware`, etc.
+- **Custom capabilities / privileged escape hatch:** Use `--cap-add`, `--cap-drop`, or `--privileged` when strictly required.
+- **Rootless mode (`CLONE_NEWUSER`):** Automatically used when invoked without `sudo` (or with `--rootless`). Uses `/etc/subuid` + `/etc/subgid` via `newuidmap`/`newgidmap` when configured, or falls back to single-UID mapping (`0 -> host_uid`).
+
+---
+
+## 6. Live Host Verification
+
+On a real Linux host (with `sudo` or unprivileged user namespaces enabled), run:
+
+```bash
+sudo ./scripts/verify_host.sh
+```

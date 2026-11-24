@@ -19,6 +19,7 @@ struct PiecefileInstruction {
 struct PiecefileSpec {
     std::optional<std::string> from_image;
     std::optional<std::string> from_url;
+    std::optional<std::string> sha256;
     std::map<std::string, std::string> env;
     std::optional<std::string> workdir;
     std::vector<std::pair<std::string, std::string>> copies;

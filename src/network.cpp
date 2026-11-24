@@ -1,11 +1,13 @@
 #include "pieces/network.hpp"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +23,59 @@ namespace fs = std::filesystem;
 namespace pieces {
 
 namespace {
+
+struct FileLockGuard {
+    int fd{-1};
+    explicit FileLockGuard(const fs::path& lock_path) {
+        fs::create_directories(lock_path.parent_path());
+        fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(), "open(" + lock_path.string() + ")");
+        }
+        if (::flock(fd, LOCK_EX) != 0) {
+            int err = errno;
+            ::close(fd);
+            fd = -1;
+            throw std::system_error(err, std::generic_category(), "flock(" + lock_path.string() + ")");
+        }
+    }
+    ~FileLockGuard() {
+        if (fd >= 0) {
+            ::flock(fd, LOCK_UN);
+            ::close(fd);
+        }
+    }
+    FileLockGuard(const FileLockGuard&) = delete;
+    FileLockGuard& operator=(const FileLockGuard&) = delete;
+};
+
+JsonObject read_ipam_leases(const fs::path& leases_path) {
+    std::error_code ec;
+    if (!fs::is_regular_file(leases_path, ec)) {
+        return {};
+    }
+    std::ifstream in(leases_path);
+    if (!in) return {};
+    std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try {
+        JsonValue v = JsonValue::parse(s);
+        if (v.is_object()) return v.as_object();
+    } catch (const std::exception&) {
+    }
+    return {};
+}
+
+void write_ipam_leases(const fs::path& leases_path, const JsonObject& leases) {
+    fs::path tmp = leases_path;
+    tmp += ".tmp." + std::to_string(::getpid());
+    {
+        std::ofstream out(tmp);
+        if (!out) return;
+        out << JsonValue(leases).dump(2) << "\n";
+    }
+    std::error_code ec;
+    fs::rename(tmp, leases_path, ec);
+}
 
 bool command_exists(const std::string& cmd) {
     const char* path_env = std::getenv("PATH");
@@ -247,19 +302,47 @@ bool setup_host_network(
     return true;
 }
 
-std::string allocate_container_ip(const std::string& containers_dir) {
+std::string allocate_container_ip(
+    const std::string& containers_dir,
+    const std::string& owner_id) {
+    fs::path cdir(containers_dir);
+    FileLockGuard lock(cdir / ".ipam.lock");
+
     std::set<std::string> used_ips;
+    fs::path leases_path = cdir / ".ipam_leases.json";
+    JsonObject leases = read_ipam_leases(leases_path);
+
+    // Prune leases for containers that are no longer running and collect active ones
+    JsonObject clean_leases;
+    for (const auto& [cid, ip_val] : leases) {
+        if (!ip_val.is_string()) continue;
+        fs::path meta_path = cdir / cid / "meta.json";
+        std::error_code ec;
+        if (!fs::is_regular_file(meta_path, ec)) {
+            continue;
+        }
+        std::ifstream in(meta_path);
+        if (!in) continue;
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        try {
+            JsonValue parsed = JsonValue::parse(content);
+            const JsonValue* status = parsed.find("status");
+            if (status && status->is_string() && status->as_string() == "running") {
+                used_ips.insert(ip_val.as_string());
+                clean_leases[cid] = ip_val;
+            }
+        } catch (const std::exception&) {
+        }
+    }
+
     std::error_code ec;
-    if (fs::is_directory(containers_dir, ec)) {
-        for (const auto& entry : fs::directory_iterator(containers_dir, ec)) {
+    if (fs::is_directory(cdir, ec)) {
+        for (const auto& entry : fs::directory_iterator(cdir, ec)) {
+            if (!entry.is_directory(ec)) continue;
             fs::path meta_path = entry.path() / "meta.json";
-            if (!fs::is_regular_file(meta_path, ec)) {
-                continue;
-            }
+            if (!fs::is_regular_file(meta_path, ec)) continue;
             std::ifstream in(meta_path);
-            if (!in) {
-                continue;
-            }
+            if (!in) continue;
             std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             try {
                 JsonValue parsed = JsonValue::parse(content);
@@ -278,10 +361,27 @@ std::string allocate_container_ip(const std::string& containers_dir) {
     for (int host_octet = 2; host_octet < 255; ++host_octet) {
         std::string candidate = "10.0.0." + std::to_string(host_octet);
         if (!used_ips.contains(candidate)) {
+            if (!owner_id.empty()) {
+                clean_leases[owner_id] = candidate;
+            }
+            write_ipam_leases(leases_path, clean_leases);
             return candidate;
         }
     }
     throw std::runtime_error("No free IP addresses left in 10.0.0.0/24");
+}
+
+void release_container_ip(const std::string& containers_dir, const std::string& owner_id) {
+    if (owner_id.empty()) return;
+    fs::path cdir(containers_dir);
+    std::error_code ec;
+    if (!fs::is_directory(cdir, ec)) return;
+    FileLockGuard lock(cdir / ".ipam.lock");
+    fs::path leases_path = cdir / ".ipam_leases.json";
+    JsonObject leases = read_ipam_leases(leases_path);
+    if (leases.erase(owner_id) > 0) {
+        write_ipam_leases(leases_path, leases);
+    }
 }
 
 ContainerNetwork build_network_plan(
@@ -294,7 +394,7 @@ ContainerNetwork build_network_plan(
     return {
         DEFAULT_BRIDGE,
         DEFAULT_GATEWAY_IP,
-        allocate_container_ip(containers_dir),
+        allocate_container_ip(containers_dir, container_id),
         24,
         "vp-" + short_id,
         "vc-" + short_id,

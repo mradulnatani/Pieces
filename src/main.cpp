@@ -36,7 +36,7 @@ int handle_build(const pieces::CliArgs& args) {
     }
 
     std::cout << "BUILD: Creating image '" << image_name << "'...\n";
-    return pieces::build_image(*spec, image_path, args.context) ? 0 : 1;
+    return pieces::build_image(*spec, image_path, args.context, nullptr, nullptr, nullptr, args.no_cache) ? 0 : 1;
 }
 
 int handle_pull(const pieces::CliArgs& args) {
@@ -67,11 +67,19 @@ int handle_run(const pieces::CliArgs& args) {
         cfg.name = args.name;
         cfg.auto_remove = args.auto_remove;
         cfg.detach = args.detach;
+        cfg.interactive = args.interactive;
+        cfg.allocate_tty = args.allocate_tty;
         cfg.rootless = args.rootless;
+        cfg.privileged = args.privileged;
+        cfg.restart_policy = pieces::parse_restart_policy(args.restart_policy);
+        cfg.log_max_bytes = pieces::parse_byte_size(args.log_max_size);
+        cfg.log_max_files = args.log_max_files;
         cfg.network_mode = args.network_mode;
         cfg.env_specs = args.env_specs;
         cfg.volume_specs = args.volume_specs;
         cfg.port_specs = args.port_specs;
+        cfg.cap_add = args.cap_add;
+        cfg.cap_drop = args.cap_drop;
         cfg.memory_limit = args.memory_limit;
         cfg.cpu_limit = args.cpu_limit;
         cfg.pids_limit = args.pids_limit;
@@ -194,7 +202,8 @@ int handle_logs(const pieces::CliArgs& args) {
 
 int handle_exec(const pieces::CliArgs& args) {
     try {
-        return pieces::exec_in_container(args.target_container, args.cmd_args, args.env_specs, args.workdir);
+        return pieces::exec_in_container(
+            args.target_container, args.cmd_args, args.env_specs, args.workdir, args.allocate_tty);
     } catch (const std::exception& exc) {
         std::cerr << "exec: " << exc.what() << "\n";
         return 1;
@@ -227,6 +236,12 @@ int handle_rmi(const pieces::CliArgs& args) {
         }
     }
     return rc;
+}
+
+int handle_prune() {
+    int removed = pieces::prune_unused_data();
+    std::cout << "Pruned " << removed << " unused container/cache item(s).\n";
+    return 0;
 }
 
 }  // namespace
@@ -264,6 +279,8 @@ int main(int argc, char* argv[]) {
             return handle_rm(args);
         case pieces::CliCommand::Rmi:
             return handle_rmi(args);
+        case pieces::CliCommand::Prune:
+            return handle_prune();
     }
     return 1;
 }

@@ -18,12 +18,12 @@ std::string require_value(const std::vector<std::string>& args, size_t& i, const
 
 void print_help() {
     std::cout <<
-        "usage: pieces [-h] {build,pull,run,images,ps,stop,logs,exec,rm,rmi} ...\n\n"
-        "Pieces: A lightweight Linux container runtime in C++.\n\n"
+        "usage: pieces [-h] {build,pull,run,images,ps,stop,logs,exec,rm,rmi,prune} ...\n\n"
+        "Pieces: A hardened Linux container runtime in C++20.\n\n"
         "positional arguments:\n"
-        "  {build,pull,run,images,ps,stop,logs,exec,rm,rmi}\n"
+        "  {build,pull,run,images,ps,stop,logs,exec,rm,rmi,prune}\n"
         "    build               Build an image from a Piecefile (executes COPY/RUN in order).\n"
-        "    pull                Pull an OCI/Docker Hub image into local storage.\n"
+        "    pull                Pull an OCI image from a non-Docker-Hub registry.\n"
         "    run                 Run a command inside a new container.\n"
         "    images              List built/pulled images.\n"
         "    ps                  List containers.\n"
@@ -31,7 +31,8 @@ void print_help() {
         "    logs                View logs from a detached container.\n"
         "    exec                Execute a command inside a running container.\n"
         "    rm                  Remove one or more containers.\n"
-        "    rmi                 Remove one or more images.\n\n"
+        "    rmi                 Remove one or more images.\n"
+        "    prune               Remove stopped containers and cached download artifacts.\n\n"
         "options:\n"
         "  -h, --help            show this help message and exit\n";
 }
@@ -63,6 +64,8 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
             const std::string& tok = args[i];
             if (tok == "-t" || tok == "--tag") {
                 parsed.tag = require_value(args, i, tok);
+            } else if (tok == "--no-cache") {
+                parsed.no_cache = true;
             } else if (tok == "-h" || tok == "--help") {
                 parsed.command = CliCommand::Help;
                 return parsed;
@@ -118,8 +121,27 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
                 parsed.auto_remove = true;
             } else if (tok == "-d" || tok == "--detach") {
                 parsed.detach = true;
+            } else if (tok == "-i" || tok == "--interactive") {
+                parsed.interactive = true;
+            } else if (tok == "-t" || tok == "--tty") {
+                parsed.allocate_tty = true;
+            } else if (tok == "-it" || tok == "-ti") {
+                parsed.interactive = true;
+                parsed.allocate_tty = true;
             } else if (tok == "--rootless") {
                 parsed.rootless = true;
+            } else if (tok == "--privileged") {
+                parsed.privileged = true;
+            } else if (tok == "--restart") {
+                parsed.restart_policy = require_value(args, i, tok);
+            } else if (tok == "--log-max-size") {
+                parsed.log_max_size = require_value(args, i, tok);
+            } else if (tok == "--log-max-files") {
+                parsed.log_max_files = std::stoi(require_value(args, i, tok));
+            } else if (tok == "--cap-add") {
+                parsed.cap_add.push_back(require_value(args, i, tok));
+            } else if (tok == "--cap-drop") {
+                parsed.cap_drop.push_back(require_value(args, i, tok));
             } else if (tok == "--net") {
                 std::string mode = require_value(args, i, tok);
                 if (mode != "bridge" && mode != "none") {
@@ -232,7 +254,14 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
         size_t i = 1;
         while (i < args.size()) {
             const std::string& tok = args[i];
-            if (tok == "-e" || tok == "--env") {
+            if (tok == "-i" || tok == "--interactive") {
+                parsed.interactive = true;
+            } else if (tok == "-t" || tok == "--tty") {
+                parsed.allocate_tty = true;
+            } else if (tok == "-it" || tok == "-ti") {
+                parsed.interactive = true;
+                parsed.allocate_tty = true;
+            } else if (tok == "-e" || tok == "--env") {
                 parsed.env_specs.push_back(require_value(args, i, tok));
             } else if (tok == "-w" || tok == "--workdir") {
                 parsed.workdir = require_value(args, i, tok);
@@ -292,6 +321,11 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
         if (parsed.images.empty()) {
             throw std::invalid_argument("rmi requires at least one image name");
         }
+        return parsed;
+    }
+
+    if (sub == "prune") {
+        parsed.command = CliCommand::Prune;
         return parsed;
     }
 
