@@ -3,7 +3,9 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <curl/curl.h>
+#include <sched.h>
 #include <sys/mount.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -19,11 +21,16 @@
 #include <stdexcept>
 #include <system_error>
 
+#include "pieces/namespaces.hpp"
+
 namespace fs = std::filesystem;
 
 namespace pieces {
 
 namespace {
+
+constexpr const char* DEFAULT_BUILD_PATH =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 const std::regex& valid_name_regex() {
     static const std::regex kRegex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$");
@@ -151,6 +158,124 @@ void configure_container_dns_and_hosts(const fs::path& rootfs_dir, const std::st
     }
 }
 
+int default_run_build_step(
+    const std::string& rootfs_dir,
+    const std::string& command,
+    const std::map<std::string, std::string>& env,
+    const std::string& workdir) {
+    std::cout << "BUILD: RUN " << command << "\n" << std::flush;
+    configure_container_dns_and_hosts(rootfs_dir, "pieces-build");
+
+    bool rootless = (::geteuid() != 0);
+    uid_t host_uid = ::getuid();
+    gid_t host_gid = ::getgid();
+
+    std::vector<std::string> env_entries;
+    std::map<std::string, std::string> merged = {
+        {"PATH", DEFAULT_BUILD_PATH},
+        {"HOME", "/root"},
+        {"TERM", "xterm"},
+    };
+    for (const auto& [k, v] : env) {
+        merged[k] = v;
+    }
+    env_entries.reserve(merged.size());
+    for (const auto& [k, v] : merged) {
+        env_entries.push_back(k + "=" + v);
+    }
+
+    pid_t pid1 = ::fork();
+    if (pid1 < 0) {
+        return 1;
+    }
+    if (pid1 == 0) {
+        try {
+            int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC;
+            if (rootless) {
+                ns_flags |= CLONE_NEWUSER;
+            }
+            unshare_namespaces(ns_flags);
+            if (rootless) {
+                write_user_namespace_maps("/proc/self", host_uid, host_gid);
+            }
+
+            pid_t pid2 = ::fork();
+            if (pid2 < 0) {
+                ::_exit(1);
+            }
+            if (pid2 == 0) {
+                try {
+                    setup_container_mounts(rootfs_dir, {}, rootless);
+                    if (!workdir.empty() && workdir != "/") {
+                        fs::create_directories(workdir);
+                        if (::chdir(workdir.c_str()) != 0) {
+                            ::_exit(1);
+                        }
+                    }
+                    std::string sh_bin = "/bin/sh";
+                    std::string c_flag = "-c";
+                    std::string cmd_copy = command;
+                    char* argv[] = {sh_bin.data(), c_flag.data(), cmd_copy.data(), nullptr};
+                    std::vector<char*> env_ptrs;
+                    env_ptrs.reserve(env_entries.size() + 1);
+                    for (auto& e : env_entries) {
+                        env_ptrs.push_back(e.data());
+                    }
+                    env_ptrs.push_back(nullptr);
+                    ::execvpe(argv[0], argv, env_ptrs.data());
+                    ::_exit(127);
+                } catch (const std::exception& exc) {
+                    std::cerr << "BUILD RUN ERROR: " << exc.what() << "\n";
+                    ::_exit(1);
+                }
+            } else {
+                int st2 = 0;
+                ::waitpid(pid2, &st2, 0);
+                if (WIFEXITED(st2)) ::_exit(WEXITSTATUS(st2));
+                ::_exit(1);
+            }
+        } catch (const std::exception& exc) {
+            std::cerr << "BUILD RUN ERROR: " << exc.what() << "\n";
+            ::_exit(1);
+        }
+    }
+
+    int status1 = 0;
+    if (::waitpid(pid1, &status1, 0) < 0) {
+        return 1;
+    }
+    if (WIFEXITED(status1)) {
+        return WEXITSTATUS(status1);
+    }
+    return 1;
+}
+
+bool handle_oci_whiteout_entry(const fs::path& dest_real, const std::string& rel) {
+    fs::path rel_path(rel);
+    std::string fname = rel_path.filename().string();
+    fs::path parent_rel = rel_path.parent_path();
+    fs::path target_dir = parent_rel.empty() ? dest_real : (dest_real / parent_rel);
+
+    if (fname == ".wh..wh..opq") {
+        std::error_code ec;
+        if (fs::is_directory(target_dir, ec)) {
+            for (const auto& item : fs::directory_iterator(target_dir, ec)) {
+                fs::remove_all(item.path(), ec);
+            }
+        }
+        return true;
+    }
+    if (fname.rfind(".wh.", 0) == 0) {
+        std::string victim_name = fname.substr(4);
+        if (!victim_name.empty() && victim_name != "." && victim_name != "..") {
+            std::error_code ec;
+            fs::remove_all(target_dir / victim_name, ec);
+        }
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 const std::map<std::string, std::string>& known_images() {
@@ -183,7 +308,11 @@ std::string derive_image_name(const PiecefileSpec& spec, const std::string& tag)
     if (!tag.empty()) {
         raw = tag;
     } else if (spec.from_image.has_value()) {
-        raw = *spec.from_image;
+        try {
+            raw = parse_image_reference(*spec.from_image).default_local_name();
+        } catch (const std::exception&) {
+            raw = *spec.from_image;
+        }
     } else if (spec.from_url.has_value()) {
         std::string url = *spec.from_url;
         auto qpos = url.find_first_of("?#");
@@ -198,6 +327,7 @@ std::string derive_image_name(const PiecefileSpec& spec, const std::string& tag)
     }
 
     std::replace(raw.begin(), raw.end(), ':', '-');
+    std::replace(raw.begin(), raw.end(), '/', '-');
     return validate_name(raw, "image");
 }
 
@@ -212,7 +342,10 @@ std::string resolve_image_path(const std::string& image_name, const std::string&
     return target.string();
 }
 
-void safe_extract_tar_file(const std::string& tar_path, const std::string& dest_dir) {
+void safe_extract_tar_file(
+    const std::string& tar_path,
+    const std::string& dest_dir,
+    bool handle_oci_whiteouts) {
     fs::create_directories(dest_dir);
     fs::path dest_real = fs::weakly_canonical(fs::absolute(dest_dir));
 
@@ -268,6 +401,12 @@ void safe_extract_tar_file(const std::string& tar_path, const std::string& dest_
 
         const char* raw_name = archive_entry_pathname(entry);
         std::string rel = normalize_relative_tar_path(raw_name ? raw_name : "");
+
+        if (handle_oci_whiteouts && handle_oci_whiteout_entry(dest_real, rel)) {
+            archive_read_data_skip(reader.a);
+            continue;
+        }
+
         fs::path full_dest = (rel == ".") ? dest_real : (dest_real / rel);
         archive_entry_set_pathname(entry, full_dest.c_str());
 
@@ -360,26 +499,9 @@ bool build_image(
     const PiecefileSpec& spec,
     const std::string& image_path,
     const std::string& context_dir,
-    const DownloadFn& downloader) {
-    std::string url;
-    if (spec.from_image.has_value()) {
-        auto it = known_images().find(*spec.from_image);
-        if (it == known_images().end()) {
-            std::cerr << "BUILD: Error: Unknown image tag '" << *spec.from_image << "'.\n";
-            return false;
-        }
-        url = it->second;
-    } else if (spec.from_url.has_value()) {
-        url = *spec.from_url;
-        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
-            std::cerr << "BUILD: Error: Unsupported URL scheme in '" << url << "'. Use http or https.\n";
-            return false;
-        }
-    } else {
-        std::cerr << "BUILD: Error: Piecefile has neither FROM nor FROM_URL.\n";
-        return false;
-    }
-
+    const DownloadFn& downloader,
+    const RunStepFn& run_step_fn,
+    const HttpGetFn& registry_http_get) {
     fs::path abs_image = fs::absolute(image_path);
     fs::path parent_dir = abs_image.parent_path();
     fs::create_directories(parent_dir);
@@ -390,32 +512,147 @@ bool build_image(
     std::error_code ec;
     fs::remove_all(staging_dir, ec);
     fs::remove(tmp_tar, ec);
-    fs::create_directories(staging_dir);
 
     try {
-        std::cout << "BUILD: Downloading from " << url << "...\n";
-        DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
-        dl(url, tmp_tar.string());
+        if (spec.from_url.has_value()) {
+            const std::string& url = *spec.from_url;
+            if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+                throw std::invalid_argument("Unsupported URL scheme in '" + url + "'. Use http or https.");
+            }
+            fs::create_directories(staging_dir);
+            std::cout << "BUILD: Downloading from " << url << "...\n";
+            DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
+            dl(url, tmp_tar.string());
+            std::cout << "BUILD: Unpacking base rootfs...\n";
+            safe_extract_tar_file(tmp_tar.string(), staging_dir.string());
+            fs::remove(tmp_tar, ec);
+        } else if (spec.from_image.has_value()) {
+            auto it = known_images().find(*spec.from_image);
+            if (it != known_images().end() && !registry_http_get) {
+                fs::create_directories(staging_dir);
+                std::cout << "BUILD: Downloading from " << it->second << "...\n";
+                DownloadFn dl = downloader ? downloader : DownloadFn(default_curl_download);
+                dl(it->second, tmp_tar.string());
+                std::cout << "BUILD: Unpacking base rootfs...\n";
+                safe_extract_tar_file(tmp_tar.string(), staging_dir.string());
+                fs::remove(tmp_tar, ec);
+            } else {
+                if (!pull_oci_image(*spec.from_image, staging_dir.string(), registry_http_get)) {
+                    throw std::runtime_error("Failed to pull base image '" + *spec.from_image + "'");
+                }
+            }
+        } else {
+            throw std::invalid_argument("Piecefile has neither FROM nor FROM_URL.");
+        }
 
-        std::cout << "BUILD: Download complete. Unpacking to " << image_path << "...\n";
-        safe_extract_tar_file(tmp_tar.string(), staging_dir.string());
-        fs::remove(tmp_tar, ec);
+        // Load base image metadata if present (e.g., from OCI config)
+        JsonObject runtime_meta;
+        std::map<std::string, std::string> build_env;
+        std::string build_workdir = "/";
+        fs::path base_meta_path = staging_dir / ".pieces_meta.json";
+        if (fs::is_regular_file(base_meta_path, ec)) {
+            std::ifstream in(base_meta_path);
+            if (in) {
+                std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                try {
+                    JsonValue parsed = JsonValue::parse(content);
+                    if (parsed.is_object()) {
+                        runtime_meta = parsed.as_object();
+                        if (auto env_v = parsed.find("env"); env_v && env_v->is_object()) {
+                            for (const auto& [k, v] : env_v->as_object()) {
+                                if (v.is_string()) build_env[k] = v.as_string();
+                            }
+                        }
+                        if (auto wd_v = parsed.find("workdir"); wd_v && wd_v->is_string()) {
+                            build_workdir = wd_v->as_string();
+                        }
+                    }
+                } catch (const std::exception&) {
+                }
+            }
+        }
 
-        if (!spec.copies.empty()) {
+        RunStepFn exec_run = run_step_fn ? run_step_fn : RunStepFn(default_run_build_step);
+
+        // Replay Piecefile instructions in exact order
+        if (!spec.instructions.empty()) {
+            for (const auto& inst : spec.instructions) {
+                if (inst.keyword == "ENV") {
+                    for (const auto& [k, v] : spec.env) {
+                        // spec.env holds merged values; parse per-instruction from spec or update from inst
+                        (void)k;
+                        (void)v;
+                    }
+                    // Parse this single ENV instruction cleanly via parse_piecefile's public helper or split
+                    auto tokens = split_shell_words(inst.value);
+                    if (!tokens.empty() && tokens[0].find('=') != std::string::npos) {
+                        for (const auto& tok : tokens) {
+                            auto eq = tok.find('=');
+                            if (eq != std::string::npos && eq > 0) {
+                                build_env[tok.substr(0, eq)] = tok.substr(eq + 1);
+                            }
+                        }
+                    } else if (tokens.size() >= 2) {
+                        auto ws = inst.value.find_first_of(" \t");
+                        if (ws != std::string::npos) {
+                            build_env[tokens[0]] = inst.value.substr(ws + 1);
+                        }
+                    }
+                } else if (inst.keyword == "WORKDIR") {
+                    build_workdir = inst.value;
+                    std::string clean = build_workdir;
+                    while (!clean.empty() && clean.front() == '/') clean.erase(clean.begin());
+                    if (!clean.empty()) {
+                        fs::create_directories(staging_dir / clean);
+                    }
+                } else if (inst.keyword == "COPY") {
+                    auto parts = split_shell_words(inst.value);
+                    if (parts.size() != 2) {
+                        throw std::invalid_argument("COPY requires <src> <dst>");
+                    }
+                    apply_copies({{parts[0], parts[1]}}, context_dir, staging_dir.string());
+                } else if (inst.keyword == "RUN") {
+                    int rc = exec_run(staging_dir.string(), inst.value, build_env, build_workdir);
+                    if (rc != 0) {
+                        throw std::runtime_error(
+                            "RUN command '" + inst.value + "' exited with code " + std::to_string(rc));
+                    }
+                }
+            }
+        } else if (!spec.copies.empty()) {
             apply_copies(spec.copies, context_dir, staging_dir.string());
         }
 
-        if (!spec.runs.empty()) {
-            std::cerr << "BUILD: Warning: RUN instructions in Piecefile are recorded but build-time "
-                         "execution is not enabled yet; skipping RUN steps.\n";
+        // Merge final Piecefile metadata over base image metadata
+        for (const auto& [k, v] : spec.env) {
+            build_env[k] = v;
+        }
+        if (!build_env.empty()) {
+            JsonObject env_obj;
+            for (const auto& [k, v] : build_env) {
+                env_obj[k] = v;
+            }
+            runtime_meta["env"] = std::move(env_obj);
+        }
+        if (spec.workdir.has_value()) {
+            runtime_meta["workdir"] = *spec.workdir;
+        }
+        if (spec.cmd.has_value()) {
+            JsonArray arr;
+            for (const auto& item : *spec.cmd) arr.emplace_back(item);
+            runtime_meta["cmd"] = std::move(arr);
+        }
+        if (spec.entrypoint.has_value()) {
+            JsonArray arr;
+            for (const auto& item : *spec.entrypoint) arr.emplace_back(item);
+            runtime_meta["entrypoint"] = std::move(arr);
         }
 
-        fs::path meta_path = staging_dir / ".pieces_meta.json";
-        std::ofstream meta_out(meta_path);
+        std::ofstream meta_out(base_meta_path);
         if (!meta_out) {
             throw std::runtime_error("Failed to write .pieces_meta.json");
         }
-        meta_out << JsonValue(spec.to_metadata()).dump(2) << "\n";
+        meta_out << JsonValue(runtime_meta).dump(2) << "\n";
         meta_out.close();
 
         fs::path backup_dir = parent_dir / (abs_image.filename().string() + ".old." + pid_str);

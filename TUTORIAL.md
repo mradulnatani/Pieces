@@ -1,23 +1,23 @@
 # Pieces Tutorial: Getting Started & Project Integration Guide
 
-This tutorial walks you through compiling, configuring, and operating **Pieces** (written in C++20) so you can package and run isolated Linux workloads in your own projects.
+This tutorial walks you through compiling, configuring, and operating **Pieces** (written in C++20) to containerize and run full application projects.
 
 ---
 
 ## 1. Prerequisites & Build
 
-Pieces compiles to a native Linux binary (`./build/pieces`) using CMake, a C++20 compiler, `libcurl`, and `libarchive`. Because `pieces run` creates kernel namespaces, mounts filesystems, configures `veth` networking, and writes cgroup v2 limits, running containers requires root privileges (or `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`).
+Pieces compiles to a native Linux binary (`./build/pieces`) using CMake, a C++20 compiler, `libcurl`, and `libarchive`.
 
-Verify your host tools:
+Verify host tools:
 
 ```bash
 g++ --version              # C++20 compiler
 cmake --version            # CMake 3.20+
-which ip nsenter iptables  # iproute2, util-linux, optional iptables for NAT
+which ip nsenter iptables  # iproute2, util-linux, iptables (for NAT and -p port forwarding)
 ls /sys/fs/cgroup/cgroup.controllers  # cgroups v2 check
 ```
 
-Compile Pieces in Release mode:
+Compile Pieces and run the test suite:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -29,140 +29,129 @@ ctest --test-dir build --output-on-failure
 
 ## 2. Step-by-Step Walkthrough
 
-### Step 1: Create a `Piecefile` in Your Project
+### Step 1: Pull Any OCI / Docker Hub Image (Optional)
 
-Create a `Piecefile` in the root of your project directory (the *build context*):
+You can pull official or custom OCI images directly from Docker Hub or any OCI registry (`ghcr.io`, `localhost:5000`, etc.):
+
+```bash
+./build/pieces pull alpine:3.18
+./build/pieces pull python:3.12-alpine -t py312
+./build/pieces images
+```
+
+---
+
+### Step 2: Create a `Piecefile` and Build Your Project
+
+Create a `Piecefile` in your project root. Instructions (`ENV`, `WORKDIR`, `COPY`, `RUN`) execute **in exact order**:
 
 ```dockerfile
-# Supported FROM tags: alpine:3.18, fedora:38, ubuntu:22.04
-FROM alpine:3.18
+# Pulls from built-in rootfs or any OCI/Docker Hub image
+FROM python:3.12-alpine
 
-ENV APP_ENV=production PORT=8080
+ENV PYTHONDONTWRITEBYTECODE=1 PORT=8000
 WORKDIR /app
-COPY ./app /app
-CMD ["/bin/sh"]
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app
+CMD ["python", "-m", "http.server", "8000"]
 ```
+
+Build the image:
+
+```bash
+sudo ./build/pieces build . --tag my-web-app
+```
+
+> [!NOTE]
+> Build-time `RUN` executes inside an isolated namespace rooted at the staging rootfs with host DNS (`/etc/resolv.conf`). Unprivileged `RUN` builds use `CLONE_NEWUSER` automatically when kernel user namespaces are enabled; root builds work with standard privileges.
 
 #### Available `Piecefile` Instructions
 
 | Instruction | Example | Notes |
 | --- | --- | --- |
-| `FROM` | `FROM ubuntu:22.04` | Built-in base images: `alpine:3.18`, `fedora:38`, `ubuntu:22.04`. |
+| `FROM` | `FROM python:3.12-alpine` | Uses built-in tarballs (`alpine:3.18`, `fedora:38`, `ubuntu:22.04`) or pulls from OCI/Docker Hub. |
 | `FROM_URL` | `FROM_URL https://.../rootfs.tar.gz` | Downloads any HTTP/HTTPS Linux rootfs tarball via `libcurl`. |
-| `ENV` | `ENV FOO=bar BAZ="hello"` | Sets default env vars (also supports `ENV FOO bar`). |
-| `WORKDIR` | `WORKDIR /app` | Sets the default working directory inside the container. |
+| `ENV` | `ENV FOO=bar BAZ="hello"` | Sets build-time and runtime env vars. |
+| `WORKDIR` | `WORKDIR /app` | Creates and switches to the working directory for subsequent `RUN` and container `CMD`. |
 | `COPY` | `COPY ./src /app/src` | Copies files/dirs from the build context into the image safely. |
+| `RUN` | `RUN apk add --no-cache curl` | Executes `/bin/sh -c <cmd>` inside the staging rootfs during `build`. |
 | `ENTRYPOINT` | `ENTRYPOINT ["/bin/sh", "-c"]` | Fixed executable prefix; CLI args are appended to it. |
-| `CMD` | `CMD echo "hello"` | Default command/args (supports shell string or JSON array). |
-| `RUN` | `RUN echo "hi"` | Parsed and recorded, **not executed at build time yet** (skipped with a warning). |
-
-> [!TIP]
-> Long `Piecefile` instructions can be split across lines using a trailing `\`.
+| `CMD` | `CMD ["python", "app.py"]` | Default command/args (supports shell string or JSON array). |
 
 ---
 
-### Step 2: Build the Image
+### Step 3: Run Containers (Foreground, Detached, Port Mapping, Rootless)
+
+#### Detached Service with Port Publishing (`-d`, `-p`)
 
 ```bash
-# Uses default name derived from FROM (e.g. alpine-3.18)
-./build/pieces build .
-
-# Or assign a custom image tag
-./build/pieces build . --tag my-app
-
-# List built images
-./build/pieces images
+sudo ./build/pieces run -d \
+  --name web \
+  -p 8080:8000 \
+  --memory 256m \
+  --cpus 0.5 \
+  --pids-max 64 \
+  my-web-app
 ```
 
-Images are stored under `.pieces/images/<image-name>/` with runtime metadata in `.pieces_meta.json`. Rebuilding stages into a temporary directory first and swaps atomically so a failed download never overwrites an existing working image.
+- `-d` / `--detach`: Runs the container in the background, logs stdout/stderr to `.pieces/containers/<id>/container.log`, and prints the container ID.
+- `-p` / `--publish`: Forwards host port `8080` to container port `8000` (`[HOST_IP:]HOST_PORT:CONT_PORT[/tcp|udp]`) via `iptables` DNAT rules and cleans them up automatically on exit.
 
----
-
-### Step 3: Run Containers
-
-#### Interactive Shell
+#### Inspect, View Logs, and Exec into Running Containers
 
 ```bash
-sudo ./build/pieces run --rm my-app
+# List running or all containers (shows IP and published PORTS)
+./build/pieces ps
+./build/pieces ps -a
+
+# View or follow container logs
+./build/pieces logs -n 50 web
+./build/pieces logs -f web
+
+# Execute a command inside the running container's namespaces
+sudo ./build/pieces exec web /bin/sh -c "ps aux && ls -la /app"
 ```
 
-- `--rm` automatically removes `.pieces/containers/<id>/` after exit.
-- Omit `--rm` if you want to inspect exited containers via `./build/pieces ps -a`.
-
-#### One-Off Command
-
-Place `pieces run` flags **before** `<image>`, and your container command **after** `<image>`:
-
-```bash
-sudo ./build/pieces run --rm --name demo my-app /bin/ls -la /app
-```
-
-#### Mount Project Files (`-v`), Env (`-e`), and Workdir (`-w`)
+#### Interactive Foreground Run & Volume Mounts (`-v`)
 
 ```bash
 sudo ./build/pieces run --rm \
   -v "$PWD/data:/data:ro" \
-  -v "$PWD/output:/output" \
   -e APP_ENV=staging \
-  -w /app \
-  my-app /bin/sh -c "ls -la /data && env"
+  my-web-app /bin/sh
 ```
 
----
+#### Rootless Mode (Without `sudo`)
 
-### Step 4: Networking & Cgroup v2 Limits
-
-- **Bridge Networking (default `--net bridge`):** Sets up `pieces-br0` (`10.0.0.1/24`), assigns an IP in `10.0.0.2`–`10.0.0.254` to `eth0` inside the container, brings up `lo`, sets the default gateway, copies `/etc/resolv.conf`, and configures NAT masquerading if `iptables` is available.
-- **Offline Isolation (`--net none`):** Runs with an isolated empty network namespace.
-- **Cgroup v2 Resource Limits:**
+When running as a non-root user (or with `--rootless`), Pieces automatically enables `CLONE_NEWUSER` and maps container UID/GID `0` to your host user in `uid_map`/`gid_map`:
 
 ```bash
-sudo ./build/pieces run --rm \
-  --name limited-job \
-  --memory 256m \
-  --cpus 0.5 \
-  --pids-max 64 \
-  my-app /bin/sh -c "echo running within limits"
+./build/pieces run --rm --net none alpine-3.18 /bin/sh -c "id && uname -a"
 ```
+
+> [!NOTE]
+> Host bridge `veth` creation and `-p` `iptables` forwarding require host `CAP_NET_ADMIN` (`sudo`); in rootless mode, container filesystem/PID/mount/UTS/IPC isolation still operates without `sudo`.
 
 ---
 
-### Step 5: Inspect & Clean Up State
+### Step 4: Stop & Clean Up
 
 ```bash
-./build/pieces ps          # Running containers
-./build/pieces ps -a       # Running + exited containers
-./build/pieces rm demo     # Remove exited container (add -f to force)
-./build/pieces rmi my-app  # Remove image
+sudo ./build/pieces stop web        # Sends SIGTERM, then SIGKILL after timeout (-t)
+./build/pieces rm web               # Removes stopped container (use -f to force)
+./build/pieces rmi my-web-app       # Removes image
 ```
 
 ---
 
-## 3. Integrating Pieces into Your Project
-
-Install `./build/pieces` onto your `PATH` (e.g. `sudo cp ./build/pieces /usr/local/bin/pieces`) and invoke it from project scripts:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-pieces build . --tag my-project-env
-exec sudo pieces run --rm \
-  --memory 512m \
-  --cpus 1.0 \
-  -v "$PWD:/workspace" \
-  -w /workspace \
-  my-project-env "$@"
-```
-
----
-
-## 4. Troubleshooting
+## 3. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `unshare: Operation not permitted` | Running `pieces run` without root/`CAP_SYS_ADMIN` | Run `./build/pieces run` with `sudo`. |
-| `BUILD: Warning: RUN instructions...` | Build-time `RUN` execution is not implemented yet | Pre-bake files via `COPY` or run setup commands in `CMD` / `ENTRYPOINT`. |
-| `CGROUP: Warning: cgroup v2 not detected` | Host lacks cgroup v2 at `/sys/fs/cgroup` | Container continues without limits; enable cgroup v2 unified hierarchy if limits are needed. |
-| `NETWORK: Warning: failed to create bridge` | Missing `iproute2` or `CAP_NET_ADMIN` | Install `iproute2` (`ip`) and run with `sudo`, or pass `--net none`. |
-| `Image '...' not found` | Image not built yet or name mismatch | Run `./build/pieces images` to check exact image names. |
+| `unshare: Operation not permitted` / `ENOSYS` | Kernel user namespaces disabled or blocked by host sandbox | Run with `sudo` or enable `kernel.unprivileged_userns_clone=1`. |
+| `PULL: Manifest fetch failed` | No internet access or invalid image ref/tag | Verify registry connectivity and `repo:tag` spelling. |
+| `NETWORK: Warning: -p port forwarding requires root` | Running rootless with `-p` | Run with `sudo ./build/pieces run ... -p ...`. |
+| `CGROUP: Warning: cgroup v2 not detected` | Host lacks cgroup v2 at `/sys/fs/cgroup` | Container runs without limits; mount cgroup v2 unified hierarchy if limits are needed. |

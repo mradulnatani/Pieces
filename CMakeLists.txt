@@ -13,6 +13,7 @@ add_library(pieces_core STATIC
     src/parser.cpp
     src/cli.cpp
     src/filesystem.cpp
+    src/registry.cpp
     src/namespaces.cpp
     src/cgroup.cpp
     src/network.cpp

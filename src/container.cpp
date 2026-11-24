@@ -1,6 +1,8 @@
 #include "pieces/container.hpp"
 
+#include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -18,6 +20,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include "pieces/cgroup.hpp"
 #include "pieces/namespaces.hpp"
@@ -79,6 +82,36 @@ void write_container_meta(const std::string& container_dir, const JsonObject& me
     }
 }
 
+std::optional<JsonObject> read_meta_object(const fs::path& meta_path) {
+    std::error_code ec;
+    if (!fs::is_regular_file(meta_path, ec)) {
+        return std::nullopt;
+    }
+    std::ifstream in(meta_path);
+    if (!in) {
+        return std::nullopt;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try {
+        JsonValue parsed = JsonValue::parse(content);
+        if (parsed.is_object()) {
+            return parsed.as_object();
+        }
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+bool is_pid_alive(int pid) {
+    if (pid <= 0) {
+        return false;
+    }
+    if (::kill(pid, 0) == 0) {
+        return true;
+    }
+    return errno == EPERM;
+}
+
 std::optional<std::string> find_container_dir(const std::string& identifier, const std::string& containers_dir) {
     std::error_code ec;
     if (!fs::is_directory(containers_dir, ec)) {
@@ -96,22 +129,12 @@ std::optional<std::string> find_container_dir(const std::string& identifier, con
         if (dirname.rfind(identifier, 0) == 0) {
             return entry.path().string();
         }
-        fs::path meta_path = entry.path() / "meta.json";
-        if (!fs::is_regular_file(meta_path, ec)) {
-            continue;
-        }
-        std::ifstream in(meta_path);
-        if (!in) {
-            continue;
-        }
-        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        try {
-            JsonValue parsed = JsonValue::parse(content);
-            const JsonValue* name_val = parsed.find("name");
-            if (name_val && name_val->is_string() && name_val->as_string() == identifier) {
+        auto meta = read_meta_object(entry.path() / "meta.json");
+        if (meta.has_value()) {
+            auto it = meta->find("name");
+            if (it != meta->end() && it->second.is_string() && it->second.as_string() == identifier) {
                 return entry.path().string();
             }
-        } catch (const std::exception&) {
         }
     }
     return std::nullopt;
@@ -136,27 +159,233 @@ std::string join_args(const std::vector<std::string>& args) {
     return out;
 }
 
+int execute_container_supervisor(
+    const ContainerRunConfig& config,
+    const std::string& container_id,
+    const std::string& container_name,
+    const std::string& hostname,
+    const std::string& container_dir,
+    const RootfsSetup& rootfs,
+    const std::vector<std::string>& command,
+    const std::map<std::string, std::string>& env_map,
+    const std::string& workdir,
+    const std::vector<VolumeMount>& volumes,
+    const std::optional<ContainerNetwork>& net_plan,
+    CgroupManager& cgroup_mgr,
+    bool rootless,
+    JsonObject& meta_record,
+    int notify_parent_fd) {
+    uid_t host_uid = ::getuid();
+    gid_t host_gid = ::getgid();
+
+    int log_fd = -1;
+    int null_fd = -1;
+    if (config.detach) {
+        fs::path log_path = fs::path(container_dir) / "container.log";
+        log_fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        null_fd = ::open("/dev/null", O_RDONLY);
+    }
+
+    int ready_pipe[2]{-1, -1};
+    int go_pipe[2]{-1, -1};
+    if (::pipe(ready_pipe) != 0 || ::pipe(go_pipe) != 0) {
+        if (ready_pipe[0] >= 0) { ::close(ready_pipe[0]); ::close(ready_pipe[1]); }
+        if (log_fd >= 0) ::close(log_fd);
+        if (null_fd >= 0) ::close(null_fd);
+        if (notify_parent_fd >= 0) {
+            [[maybe_unused]] ssize_t w = ::write(notify_parent_fd, "ERR\n", 4);
+            ::close(notify_parent_fd);
+        }
+        return 1;
+    }
+
+    std::vector<std::string> env_entries;
+    env_entries.reserve(env_map.size());
+    for (const auto& [k, v] : env_map) {
+        env_entries.push_back(k + "=" + v);
+    }
+
+    int exit_code = 1;
+    pid_t pid1 = ::fork();
+    if (pid1 < 0) {
+        ::close(ready_pipe[0]); ::close(ready_pipe[1]);
+        ::close(go_pipe[0]); ::close(go_pipe[1]);
+        if (log_fd >= 0) ::close(log_fd);
+        if (null_fd >= 0) ::close(null_fd);
+        if (notify_parent_fd >= 0) {
+            [[maybe_unused]] ssize_t w = ::write(notify_parent_fd, "ERR\n", 4);
+            ::close(notify_parent_fd);
+        }
+        return 1;
+    }
+
+    if (pid1 == 0) {
+        ::close(ready_pipe[0]);
+        ::close(go_pipe[1]);
+        if (notify_parent_fd >= 0) {
+            ::close(notify_parent_fd);
+        }
+        try {
+            int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC;
+            if (rootless) {
+                ns_flags |= CLONE_NEWUSER;
+            }
+            unshare_namespaces(ns_flags);
+            if (rootless) {
+                write_user_namespace_maps("/proc/self", host_uid, host_gid);
+            }
+
+            pid_t pid2 = ::fork();
+            if (pid2 < 0) {
+                throw std::system_error(errno, std::generic_category(), "fork(pid2)");
+            }
+
+            if (pid2 == 0) {
+                ::close(ready_pipe[1]);
+                try {
+                    char buf = 0;
+                    [[maybe_unused]] ssize_t n = ::read(go_pipe[0], &buf, 1);
+                    ::close(go_pipe[0]);
+
+                    if (log_fd >= 0) {
+                        ::dup2(log_fd, STDOUT_FILENO);
+                        ::dup2(log_fd, STDERR_FILENO);
+                        ::close(log_fd);
+                    }
+                    if (null_fd >= 0) {
+                        ::dup2(null_fd, STDIN_FILENO);
+                        ::close(null_fd);
+                    }
+
+                    checked_sethostname(hostname);
+                    setup_container_mounts(rootfs.rootfs_dir, volumes, rootless);
+                    if (!workdir.empty() && workdir != "/") {
+                        fs::create_directories(workdir);
+                        if (::chdir(workdir.c_str()) != 0) {
+                            throw std::system_error(errno, std::generic_category(), "chdir(" + workdir + ")");
+                        }
+                    }
+
+                    std::vector<char*> argv_ptrs;
+                    argv_ptrs.reserve(command.size() + 1);
+                    for (auto& arg : const_cast<std::vector<std::string>&>(command)) {
+                        argv_ptrs.push_back(arg.data());
+                    }
+                    argv_ptrs.push_back(nullptr);
+
+                    std::vector<char*> env_ptrs;
+                    env_ptrs.reserve(env_entries.size() + 1);
+                    for (auto& e : env_entries) {
+                        env_ptrs.push_back(e.data());
+                    }
+                    env_ptrs.push_back(nullptr);
+
+                    ::execvpe(argv_ptrs[0], argv_ptrs.data(), env_ptrs.data());
+                    int err = errno;
+                    std::cerr << "CONTAINER ERROR: execvpe(" << command[0] << ") failed: "
+                              << std::strerror(err) << "\n";
+                    ::_exit(err == ENOENT ? 127 : 126);
+                } catch (const std::exception& exc) {
+                    std::cerr << "CONTAINER ERROR: " << exc.what() << "\n";
+                    ::_exit(1);
+                }
+            } else {
+                ::close(go_pipe[0]);
+                if (log_fd >= 0) ::close(log_fd);
+                if (null_fd >= 0) ::close(null_fd);
+                std::string pid_msg = std::to_string(pid2) + "\n";
+                [[maybe_unused]] ssize_t written = ::write(ready_pipe[1], pid_msg.data(), pid_msg.size());
+                ::close(ready_pipe[1]);
+
+                int status2 = 0;
+                ::waitpid(pid2, &status2, 0);
+                ::_exit(waitstatus_to_exitcode(status2));
+            }
+        } catch (const std::exception& exc) {
+            std::cerr << "CHILD ERROR: " << exc.what() << "\n";
+            if (log_fd >= 0) ::close(log_fd);
+            if (null_fd >= 0) ::close(null_fd);
+            ::close(ready_pipe[1]);
+            ::close(go_pipe[0]);
+            ::_exit(1);
+        }
+    }
+
+    // Supervisor (or parent in foreground mode)
+    ::close(ready_pipe[1]);
+    ::close(go_pipe[0]);
+    if (log_fd >= 0) ::close(log_fd);
+    if (null_fd >= 0) ::close(null_fd);
+
+    std::string raw_pid;
+    char buf[64];
+    while (true) {
+        ssize_t n = ::read(ready_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        raw_pid.append(buf, static_cast<size_t>(n));
+    }
+    ::close(ready_pipe[0]);
+
+    while (!raw_pid.empty() && (raw_pid.back() == '\n' || raw_pid.back() == '\r')) {
+        raw_pid.pop_back();
+    }
+
+    int grandchild_pid = 0;
+    if (!raw_pid.empty() && std::all_of(raw_pid.begin(), raw_pid.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        grandchild_pid = std::stoi(raw_pid);
+        cgroup_mgr.setup(grandchild_pid);
+        if (net_plan.has_value()) {
+            if (!setup_container_network(grandchild_pid, *net_plan)) {
+                meta_record["ip"] = "";
+                meta_record["ports"] = JsonArray{};
+            }
+        }
+        meta_record["pid"] = static_cast<int64_t>(grandchild_pid);
+        write_container_meta(container_dir, meta_record);
+    }
+
+    [[maybe_unused]] ssize_t gw = ::write(go_pipe[1], "1", 1);
+    ::close(go_pipe[1]);
+
+    if (notify_parent_fd >= 0) {
+        std::string msg = (grandchild_pid > 0) ? ("OK:" + container_id + "\n") : "ERR\n";
+        [[maybe_unused]] ssize_t nw = ::write(notify_parent_fd, msg.data(), msg.size());
+        ::close(notify_parent_fd);
+    }
+
+    int status1 = 0;
+    if (::waitpid(pid1, &status1, 0) >= 0) {
+        exit_code = waitstatus_to_exitcode(status1);
+    }
+
+    if (net_plan.has_value()) {
+        cleanup_port_forwarding(*net_plan);
+        cleanup_container_network(net_plan->host_veth);
+    }
+    cgroup_mgr.cleanup();
+    cleanup_container_rootfs(container_dir, rootfs.method);
+
+    if (config.auto_remove) {
+        std::error_code ec;
+        fs::remove_all(container_dir, ec);
+    } else {
+        meta_record["status"] = "exited";
+        meta_record["pid"] = static_cast<int64_t>(0);
+        meta_record["exit_code"] = static_cast<int64_t>(exit_code);
+        write_container_meta(container_dir, meta_record);
+    }
+
+    if (!config.detach) {
+        std::cout << "RUN: Container '" << container_name << "' exited with code " << exit_code << ".\n";
+    }
+    return exit_code;
+}
+
 }  // namespace
 
 JsonObject load_image_metadata(const std::string& image_path) {
-    fs::path meta_path = fs::path(image_path) / ".pieces_meta.json";
-    std::error_code ec;
-    if (!fs::is_regular_file(meta_path, ec)) {
-        return {};
-    }
-    std::ifstream in(meta_path);
-    if (!in) {
-        return {};
-    }
-    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    try {
-        JsonValue parsed = JsonValue::parse(content);
-        if (parsed.is_object()) {
-            return parsed.as_object();
-        }
-    } catch (const std::exception&) {
-    }
-    return {};
+    auto obj = read_meta_object(fs::path(image_path) / ".pieces_meta.json");
+    return obj.value_or(JsonObject{});
 }
 
 std::vector<std::string> resolve_command(
@@ -238,25 +467,28 @@ std::vector<JsonObject> list_containers(bool show_all, const std::string& contai
 
     for (const auto& entry : fs::directory_iterator(containers_dir, ec)) {
         fs::path meta_path = entry.path() / "meta.json";
-        if (!fs::is_regular_file(meta_path, ec)) {
+        auto obj_opt = read_meta_object(meta_path);
+        if (!obj_opt.has_value()) {
             continue;
         }
-        std::ifstream in(meta_path);
-        if (!in) {
-            continue;
-        }
-        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        try {
-            JsonValue parsed = JsonValue::parse(content);
-            if (!parsed.is_object()) continue;
-            const JsonValue* status = parsed.find("status");
-            bool is_running = status && status->is_string() && status->as_string() == "running";
-            if (!show_all && !is_running) {
-                continue;
+        JsonObject obj = std::move(*obj_opt);
+        auto status_it = obj.find("status");
+        bool is_running = (status_it != obj.end() && status_it->second.is_string() &&
+                           status_it->second.as_string() == "running");
+        if (is_running) {
+            auto pid_it = obj.find("pid");
+            if (pid_it != obj.end() && pid_it->second.is_int() && pid_it->second.as_int() > 0) {
+                if (!is_pid_alive(static_cast<int>(pid_it->second.as_int()))) {
+                    obj["status"] = "exited";
+                    obj["pid"] = static_cast<int64_t>(0);
+                    is_running = false;
+                }
             }
-            records.push_back(parsed.as_object());
-        } catch (const std::exception&) {
         }
+        if (!show_all && !is_running) {
+            continue;
+        }
+        records.push_back(std::move(obj));
     }
 
     std::sort(records.begin(), records.end(), [](const JsonObject& a, const JsonObject& b) {
@@ -277,33 +509,213 @@ std::string remove_container(const std::string& identifier, bool force, const st
     const std::string& target = *target_opt;
     std::string method = "copy";
 
-    fs::path meta_path = fs::path(target) / "meta.json";
-    std::error_code ec;
-    if (fs::is_regular_file(meta_path, ec)) {
-        std::ifstream in(meta_path);
-        if (in) {
-            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            try {
-                JsonValue parsed = JsonValue::parse(content);
-                const JsonValue* status = parsed.find("status");
-                if (status && status->is_string() && status->as_string() == "running" && !force) {
-                    throw std::runtime_error(
-                        "Container '" + identifier + "' is marked running; stop it or pass --force.");
-                }
-                const JsonValue* meth = parsed.find("rootfs_method");
-                if (meth && meth->is_string()) {
-                    method = meth->as_string();
-                }
-            } catch (const std::runtime_error&) {
-                throw;
-            } catch (const std::exception&) {
-            }
+    if (auto meta = read_meta_object(fs::path(target) / "meta.json"); meta.has_value()) {
+        auto status_it = meta->find("status");
+        auto pid_it = meta->find("pid");
+        bool marked_running = status_it != meta->end() && status_it->second.is_string() &&
+                              status_it->second.as_string() == "running";
+        bool alive = (pid_it != meta->end() && pid_it->second.is_int() &&
+                      is_pid_alive(static_cast<int>(pid_it->second.as_int())));
+        if (marked_running && alive && !force) {
+            throw std::runtime_error(
+                "Container '" + identifier + "' is running; stop it or pass --force.");
+        }
+        if (auto meth = meta->find("rootfs_method"); meth != meta->end() && meth->second.is_string()) {
+            method = meth->second.as_string();
         }
     }
 
     cleanup_container_rootfs(target, method);
     fs::remove_all(target);
     return fs::path(target).filename().string();
+}
+
+int stop_container(const std::string& identifier, int timeout_sec, const std::string& containers_dir) {
+    auto target_opt = find_container_dir(identifier, containers_dir);
+    if (!target_opt.has_value()) {
+        throw std::runtime_error("Container '" + identifier + "' not found");
+    }
+    auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
+    if (!meta.has_value()) {
+        throw std::runtime_error("Container metadata missing for '" + identifier + "'");
+    }
+    auto pid_it = meta->find("pid");
+    if (pid_it == meta->end() || !pid_it->second.is_int() || pid_it->second.as_int() <= 0) {
+        std::cout << "Container '" << identifier << "' is not running.\n";
+        return 0;
+    }
+    int pid = static_cast<int>(pid_it->second.as_int());
+    if (!is_pid_alive(pid)) {
+        (*meta)["status"] = "exited";
+        (*meta)["pid"] = static_cast<int64_t>(0);
+        write_container_meta(*target_opt, *meta);
+        std::cout << "Container '" << identifier << "' already exited.\n";
+        return 0;
+    }
+
+    if (::kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        throw std::system_error(errno, std::generic_category(), "kill(SIGTERM)");
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(0, timeout_sec));
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!is_pid_alive(pid)) {
+            std::cout << "Stopped container " << identifier << "\n";
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (is_pid_alive(pid)) {
+        ::kill(pid, SIGKILL);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::cout << "Stopped container " << identifier << "\n";
+    return 0;
+}
+
+int show_container_logs(
+    const std::string& identifier,
+    bool follow,
+    int tail_lines,
+    const std::string& containers_dir) {
+    auto target_opt = find_container_dir(identifier, containers_dir);
+    if (!target_opt.has_value()) {
+        throw std::runtime_error("Container '" + identifier + "' not found");
+    }
+    fs::path log_path = fs::path(*target_opt) / "container.log";
+    std::error_code ec;
+    if (!fs::is_regular_file(log_path, ec)) {
+        if (!follow) {
+            return 0;
+        }
+    }
+
+    std::streamoff offset = 0;
+    if (fs::is_regular_file(log_path, ec)) {
+        std::ifstream in(log_path, std::ios::binary);
+        if (tail_lines >= 0) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(in, line)) {
+                lines.push_back(line);
+            }
+            size_t start = (lines.size() > static_cast<size_t>(tail_lines))
+                               ? (lines.size() - static_cast<size_t>(tail_lines))
+                               : 0;
+            for (size_t i = start; i < lines.size(); ++i) {
+                std::cout << lines[i] << "\n";
+            }
+            std::cout << std::flush;
+        } else {
+            std::cout << in.rdbuf() << std::flush;
+        }
+        offset = static_cast<std::streamoff>(fs::file_size(log_path, ec));
+    }
+
+    while (follow) {
+        if (fs::is_regular_file(log_path, ec)) {
+            auto cur_size = static_cast<std::streamoff>(fs::file_size(log_path, ec));
+            if (cur_size > offset) {
+                std::ifstream in(log_path, std::ios::binary);
+                in.seekg(offset);
+                std::cout << in.rdbuf() << std::flush;
+                offset = cur_size;
+            }
+        }
+        auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
+        bool still_running = false;
+        if (meta.has_value()) {
+            auto st = meta->find("status");
+            auto p = meta->find("pid");
+            if (st != meta->end() && st->second.is_string() && st->second.as_string() == "running" &&
+                p != meta->end() && p->second.is_int() && is_pid_alive(static_cast<int>(p->second.as_int()))) {
+                still_running = true;
+            }
+        }
+        if (!still_running) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return 0;
+}
+
+int exec_in_container(
+    const std::string& identifier,
+    const std::vector<std::string>& cmd_args,
+    const std::vector<std::string>& env_specs,
+    const std::optional<std::string>& workdir,
+    const std::string& containers_dir) {
+    if (cmd_args.empty()) {
+        throw std::invalid_argument("exec requires a command to run inside the container");
+    }
+    auto target_opt = find_container_dir(identifier, containers_dir);
+    if (!target_opt.has_value()) {
+        throw std::runtime_error("Container '" + identifier + "' not found");
+    }
+    auto meta = read_meta_object(fs::path(*target_opt) / "meta.json");
+    if (!meta.has_value()) {
+        throw std::runtime_error("Container metadata missing for '" + identifier + "'");
+    }
+    auto pid_it = meta->find("pid");
+    if (pid_it == meta->end() || !pid_it->second.is_int() || pid_it->second.as_int() <= 0) {
+        throw std::runtime_error("Container '" + identifier + "' is not running");
+    }
+    int target_pid = static_cast<int>(pid_it->second.as_int());
+    if (!is_pid_alive(target_pid)) {
+        throw std::runtime_error("Container '" + identifier + "' process is not alive");
+    }
+
+    std::string hostname = identifier;
+    if (auto hn = meta->find("name"); hn != meta->end() && hn->second.is_string()) {
+        hostname = hn->second.as_string();
+    }
+    auto env_map = build_container_env(*meta, env_specs, hostname);
+    std::vector<std::string> env_entries;
+    env_entries.reserve(env_map.size());
+    for (const auto& [k, v] : env_map) {
+        env_entries.push_back(k + "=" + v);
+    }
+
+    enter_container_namespaces(target_pid);
+
+    pid_t child = ::fork();
+    if (child < 0) {
+        throw std::system_error(errno, std::generic_category(), "fork(exec)");
+    }
+    if (child == 0) {
+        if (workdir.has_value() && !workdir->empty()) {
+            if (::chdir(workdir->c_str()) != 0) {
+                std::cerr << "EXEC ERROR: chdir(" << *workdir << ") failed: " << std::strerror(errno) << "\n";
+                ::_exit(1);
+            }
+        }
+        std::vector<char*> argv_ptrs;
+        argv_ptrs.reserve(cmd_args.size() + 1);
+        for (auto& a : const_cast<std::vector<std::string>&>(cmd_args)) {
+            argv_ptrs.push_back(a.data());
+        }
+        argv_ptrs.push_back(nullptr);
+
+        std::vector<char*> env_ptrs;
+        env_ptrs.reserve(env_entries.size() + 1);
+        for (auto& e : env_entries) {
+            env_ptrs.push_back(e.data());
+        }
+        env_ptrs.push_back(nullptr);
+
+        ::execvpe(argv_ptrs[0], argv_ptrs.data(), env_ptrs.data());
+        int err = errno;
+        std::cerr << "EXEC ERROR: execvpe(" << cmd_args[0] << ") failed: " << std::strerror(err) << "\n";
+        ::_exit(err == ENOENT ? 127 : 126);
+    }
+
+    int status = 0;
+    if (::waitpid(child, &status, 0) < 0) {
+        return 1;
+    }
+    return waitstatus_to_exitcode(status);
 }
 
 int run_container(const ContainerRunConfig& config) {
@@ -343,17 +755,40 @@ int run_container(const ContainerRunConfig& config) {
         volumes.push_back(parse_volume_spec(vs));
     }
 
+    std::vector<PortMapping> ports;
+    ports.reserve(config.port_specs.size());
+    for (const auto& ps : config.port_specs) {
+        ports.push_back(parse_port_mapping(ps));
+    }
+
+    bool rootless = config.rootless || (::geteuid() != 0);
     CgroupManager cgroup_mgr(container_id, config.memory_limit, config.cpu_limit, config.pids_limit);
 
     std::optional<ContainerNetwork> net_plan;
-    if (config.network_mode == "bridge" && setup_host_network()) {
-        net_plan = build_network_plan(container_id, config.containers_dir);
+    if (config.network_mode == "bridge") {
+        if (rootless) {
+            if (!ports.empty()) {
+                std::cerr << "NETWORK: Warning: -p port forwarding requires root/CAP_NET_ADMIN; skipped in rootless mode.\n";
+            }
+        } else if (setup_host_network()) {
+            net_plan = build_network_plan(container_id, config.containers_dir, ports);
+        }
     }
 
-    std::cout << "RUN: Starting container '" << container_name << "' (" << container_id
-              << ") from '" << config.image << "'...\n" << std::flush;
+    if (!config.detach) {
+        std::cout << "RUN: Starting container '" << container_name << "' (" << container_id
+                  << ") from '" << config.image << "'" << (rootless ? " [rootless]" : "") << "...\n"
+                  << std::flush;
+    }
 
     RootfsSetup rootfs = prepare_container_rootfs(image_path, container_dir, hostname);
+
+    JsonArray port_arr;
+    if (net_plan.has_value()) {
+        for (const auto& pm : net_plan->ports) {
+            port_arr.emplace_back(format_port_mapping(pm));
+        }
+    }
 
     JsonObject meta_record;
     meta_record["id"] = container_id;
@@ -361,159 +796,67 @@ int run_container(const ContainerRunConfig& config) {
     meta_record["image"] = config.image;
     meta_record["command"] = join_args(command);
     meta_record["status"] = "running";
+    meta_record["pid"] = static_cast<int64_t>(0);
     meta_record["ip"] = net_plan.has_value() ? net_plan->container_ip : "";
+    meta_record["ports"] = std::move(port_arr);
+    meta_record["rootless"] = rootless;
     meta_record["rootfs_method"] = rootfs.method;
     meta_record["created_at"] = utc_timestamp_iso();
     meta_record["exit_code"] = nullptr;
     write_container_meta(container_dir, meta_record);
 
-    int ready_pipe[2]{-1, -1};
-    int go_pipe[2]{-1, -1};
-    if (::pipe(ready_pipe) != 0 || ::pipe(go_pipe) != 0) {
-        if (ready_pipe[0] >= 0) { ::close(ready_pipe[0]); ::close(ready_pipe[1]); }
+    if (!config.detach) {
+        return execute_container_supervisor(
+            config, container_id, container_name, hostname, container_dir, rootfs,
+            command, env_map, workdir, volumes, net_plan, cgroup_mgr, rootless, meta_record, -1);
+    }
+
+    // Detached mode: fork background supervisor and wait until container child is launched
+    int sup_pipe[2]{-1, -1};
+    if (::pipe(sup_pipe) != 0) {
         cleanup_container_rootfs(container_dir, rootfs.method);
-        throw std::system_error(errno, std::generic_category(), "pipe");
+        throw std::system_error(errno, std::generic_category(), "pipe(detach)");
     }
 
-    // Pre-build argv and envp before fork() to keep child async-signal-safe.
-    std::vector<std::string> env_entries;
-    env_entries.reserve(env_map.size());
-    for (const auto& [k, v] : env_map) {
-        env_entries.push_back(k + "=" + v);
-    }
-
-    int exit_code = 1;
-    pid_t pid1 = ::fork();
-    if (pid1 < 0) {
-        ::close(ready_pipe[0]); ::close(ready_pipe[1]);
-        ::close(go_pipe[0]); ::close(go_pipe[1]);
+    pid_t sup_pid = ::fork();
+    if (sup_pid < 0) {
+        ::close(sup_pipe[0]); ::close(sup_pipe[1]);
         cleanup_container_rootfs(container_dir, rootfs.method);
-        throw std::system_error(errno, std::generic_category(), "fork");
+        throw std::system_error(errno, std::generic_category(), "fork(detach)");
     }
 
-    if (pid1 == 0) {
-        ::close(ready_pipe[0]);
-        ::close(go_pipe[1]);
-        try {
-            int ns_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWIPC;
-            unshare_namespaces(ns_flags);
-
-            pid_t pid2 = ::fork();
-            if (pid2 < 0) {
-                throw std::system_error(errno, std::generic_category(), "fork(pid2)");
-            }
-
-            if (pid2 == 0) {
-                ::close(ready_pipe[1]);
-                try {
-                    char buf = 0;
-                    [[maybe_unused]] ssize_t n = ::read(go_pipe[0], &buf, 1);
-                    ::close(go_pipe[0]);
-
-                    checked_sethostname(hostname);
-                    setup_container_mounts(rootfs.rootfs_dir, volumes);
-                    if (!workdir.empty() && workdir != "/") {
-                        fs::create_directories(workdir);
-                        if (::chdir(workdir.c_str()) != 0) {
-                            throw std::system_error(errno, std::generic_category(), "chdir(" + workdir + ")");
-                        }
-                    }
-
-                    std::vector<char*> argv_ptrs;
-                    argv_ptrs.reserve(command.size() + 1);
-                    for (auto& arg : command) {
-                        argv_ptrs.push_back(arg.data());
-                    }
-                    argv_ptrs.push_back(nullptr);
-
-                    std::vector<char*> env_ptrs;
-                    env_ptrs.reserve(env_entries.size() + 1);
-                    for (auto& e : env_entries) {
-                        env_ptrs.push_back(e.data());
-                    }
-                    env_ptrs.push_back(nullptr);
-
-                    ::execvpe(argv_ptrs[0], argv_ptrs.data(), env_ptrs.data());
-                    int err = errno;
-                    std::cerr << "CONTAINER ERROR: execvpe(" << command[0] << ") failed: "
-                              << std::strerror(err) << "\n";
-                    ::_exit(err == ENOENT ? 127 : 126);
-                } catch (const std::exception& exc) {
-                    std::cerr << "CONTAINER ERROR: " << exc.what() << "\n";
-                    ::_exit(1);
-                }
-            } else {
-                ::close(go_pipe[0]);
-                std::string pid_msg = std::to_string(pid2) + "\n";
-                [[maybe_unused]] ssize_t written = ::write(ready_pipe[1], pid_msg.data(), pid_msg.size());
-                ::close(ready_pipe[1]);
-
-                int status2 = 0;
-                ::waitpid(pid2, &status2, 0);
-                ::_exit(waitstatus_to_exitcode(status2));
-            }
-        } catch (const std::exception& exc) {
-            std::cerr << "CHILD ERROR: " << exc.what() << "\n";
-            ::close(ready_pipe[1]);
-            ::close(go_pipe[0]);
-            ::_exit(1);
+    if (sup_pid == 0) {
+        ::close(sup_pipe[0]);
+        ::setsid();
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            ::close(devnull);
         }
+        int rc = execute_container_supervisor(
+            config, container_id, container_name, hostname, container_dir, rootfs,
+            command, env_map, workdir, volumes, net_plan, cgroup_mgr, rootless, meta_record, sup_pipe[1]);
+        ::_exit(rc);
     }
 
-    // Parent process
-    ::close(ready_pipe[1]);
-    ::close(go_pipe[0]);
-
-    std::string raw_pid;
+    ::close(sup_pipe[1]);
+    std::string reply;
     char buf[64];
     while (true) {
-        ssize_t n = ::read(ready_pipe[0], buf, sizeof(buf));
-        if (n <= 0) {
-            break;
-        }
-        raw_pid.append(buf, static_cast<size_t>(n));
+        ssize_t n = ::read(sup_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        reply.append(buf, static_cast<size_t>(n));
     }
-    ::close(ready_pipe[0]);
+    ::close(sup_pipe[0]);
 
-    while (!raw_pid.empty() && (raw_pid.back() == '\n' || raw_pid.back() == '\r')) {
-        raw_pid.pop_back();
+    if (reply.rfind("OK:", 0) == 0) {
+        std::cout << container_id << "\n";
+        return 0;
     }
-    if (!raw_pid.empty() && std::all_of(raw_pid.begin(), raw_pid.end(), [](unsigned char c) { return std::isdigit(c); })) {
-        int grandchild_pid = std::stoi(raw_pid);
-        cgroup_mgr.setup(grandchild_pid);
-        if (net_plan.has_value()) {
-            if (!setup_container_network(grandchild_pid, *net_plan)) {
-                meta_record["ip"] = "";
-                write_container_meta(container_dir, meta_record);
-            }
-        }
-    }
-
-    [[maybe_unused]] ssize_t gw = ::write(go_pipe[1], "1", 1);
-    ::close(go_pipe[1]);
-
-    int status1 = 0;
-    if (::waitpid(pid1, &status1, 0) >= 0) {
-        exit_code = waitstatus_to_exitcode(status1);
-    }
-
-    if (net_plan.has_value()) {
-        cleanup_container_network(net_plan->host_veth);
-    }
-    cgroup_mgr.cleanup();
-    cleanup_container_rootfs(container_dir, rootfs.method);
-
-    if (config.auto_remove) {
-        std::error_code ec;
-        fs::remove_all(container_dir, ec);
-    } else {
-        meta_record["status"] = "exited";
-        meta_record["exit_code"] = static_cast<int64_t>(exit_code);
-        write_container_meta(container_dir, meta_record);
-    }
-
-    std::cout << "RUN: Container '" << container_name << "' exited with code " << exit_code << ".\n";
-    return exit_code;
+    std::cerr << "RUN: Detached container failed to start.\n";
+    return 1;
 }
 
 }  // namespace pieces

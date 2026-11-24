@@ -18,14 +18,18 @@ std::string require_value(const std::vector<std::string>& args, size_t& i, const
 
 void print_help() {
     std::cout <<
-        "usage: pieces [-h] {build,run,images,ps,rm,rmi} ...\n\n"
+        "usage: pieces [-h] {build,pull,run,images,ps,stop,logs,exec,rm,rmi} ...\n\n"
         "Pieces: A lightweight Linux container runtime in C++.\n\n"
         "positional arguments:\n"
-        "  {build,run,images,ps,rm,rmi}\n"
-        "    build               Build an image from a Piecefile.\n"
+        "  {build,pull,run,images,ps,stop,logs,exec,rm,rmi}\n"
+        "    build               Build an image from a Piecefile (executes COPY/RUN in order).\n"
+        "    pull                Pull an OCI/Docker Hub image into local storage.\n"
         "    run                 Run a command inside a new container.\n"
-        "    images              List built images.\n"
+        "    images              List built/pulled images.\n"
         "    ps                  List containers.\n"
+        "    stop                Stop one or more running containers.\n"
+        "    logs                View logs from a detached container.\n"
+        "    exec                Execute a command inside a running container.\n"
         "    rm                  Remove one or more containers.\n"
         "    rmi                 Remove one or more images.\n\n"
         "options:\n"
@@ -77,6 +81,29 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
         return parsed;
     }
 
+    if (sub == "pull") {
+        parsed.command = CliCommand::Pull;
+        for (size_t i = 1; i < args.size(); ++i) {
+            const std::string& tok = args[i];
+            if (tok == "-t" || tok == "--tag") {
+                parsed.tag = require_value(args, i, tok);
+            } else if (tok == "-h" || tok == "--help") {
+                parsed.command = CliCommand::Help;
+                return parsed;
+            } else if (!tok.empty() && tok[0] == '-') {
+                throw std::invalid_argument("Unknown pull option: " + tok);
+            } else if (parsed.pull_ref.empty()) {
+                parsed.pull_ref = tok;
+            } else {
+                throw std::invalid_argument("Unexpected extra argument to pull: " + tok);
+            }
+        }
+        if (parsed.pull_ref.empty()) {
+            throw std::invalid_argument("pull requires <image_ref>");
+        }
+        return parsed;
+    }
+
     if (sub == "run") {
         parsed.command = CliCommand::Run;
         size_t i = 1;
@@ -89,6 +116,10 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
                 parsed.name = require_value(args, i, tok);
             } else if (tok == "--rm") {
                 parsed.auto_remove = true;
+            } else if (tok == "-d" || tok == "--detach") {
+                parsed.detach = true;
+            } else if (tok == "--rootless") {
+                parsed.rootless = true;
             } else if (tok == "--net") {
                 std::string mode = require_value(args, i, tok);
                 if (mode != "bridge" && mode != "none") {
@@ -99,6 +130,8 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
                 parsed.env_specs.push_back(require_value(args, i, tok));
             } else if (tok == "-v" || tok == "--volume") {
                 parsed.volume_specs.push_back(require_value(args, i, tok));
+            } else if (tok == "-p" || tok == "--publish") {
+                parsed.port_specs.push_back(require_value(args, i, tok));
             } else if (tok == "--memory") {
                 parsed.memory_limit = require_value(args, i, tok);
             } else if (tok == "--cpus") {
@@ -150,6 +183,83 @@ CliArgs parse_command_args(const std::vector<std::string>& args) {
             } else {
                 throw std::invalid_argument("Unknown ps option: " + args[i]);
             }
+        }
+        return parsed;
+    }
+
+    if (sub == "stop") {
+        parsed.command = CliCommand::Stop;
+        for (size_t i = 1; i < args.size(); ++i) {
+            const std::string& tok = args[i];
+            if (tok == "-t" || tok == "--time") {
+                parsed.timeout_sec = std::stoi(require_value(args, i, tok));
+            } else if (!tok.empty() && tok[0] == '-') {
+                throw std::invalid_argument("Unknown stop option: " + tok);
+            } else {
+                parsed.containers.push_back(tok);
+            }
+        }
+        if (parsed.containers.empty()) {
+            throw std::invalid_argument("stop requires at least one container ID or name");
+        }
+        return parsed;
+    }
+
+    if (sub == "logs") {
+        parsed.command = CliCommand::Logs;
+        for (size_t i = 1; i < args.size(); ++i) {
+            const std::string& tok = args[i];
+            if (tok == "-f" || tok == "--follow") {
+                parsed.follow = true;
+            } else if (tok == "-n" || tok == "--tail") {
+                parsed.tail_lines = std::stoi(require_value(args, i, tok));
+            } else if (!tok.empty() && tok[0] == '-') {
+                throw std::invalid_argument("Unknown logs option: " + tok);
+            } else if (parsed.target_container.empty()) {
+                parsed.target_container = tok;
+            } else {
+                throw std::invalid_argument("Unexpected extra argument to logs: " + tok);
+            }
+        }
+        if (parsed.target_container.empty()) {
+            throw std::invalid_argument("logs requires <container>");
+        }
+        return parsed;
+    }
+
+    if (sub == "exec") {
+        parsed.command = CliCommand::Exec;
+        size_t i = 1;
+        while (i < args.size()) {
+            const std::string& tok = args[i];
+            if (tok == "-e" || tok == "--env") {
+                parsed.env_specs.push_back(require_value(args, i, tok));
+            } else if (tok == "-w" || tok == "--workdir") {
+                parsed.workdir = require_value(args, i, tok);
+            } else if (tok == "--") {
+                ++i;
+                if (i >= args.size()) {
+                    throw std::invalid_argument("exec requires <container> <command>");
+                }
+                parsed.target_container = args[i++];
+                break;
+            } else if (!tok.empty() && tok[0] == '-') {
+                throw std::invalid_argument("Unknown exec option: " + tok);
+            } else {
+                parsed.target_container = tok;
+                ++i;
+                break;
+            }
+            ++i;
+        }
+        if (parsed.target_container.empty()) {
+            throw std::invalid_argument("exec requires <container> <command>");
+        }
+        while (i < args.size()) {
+            parsed.cmd_args.push_back(args[i++]);
+        }
+        if (parsed.cmd_args.empty()) {
+            throw std::invalid_argument("exec requires a command to run inside the container");
         }
         return parsed;
     }
