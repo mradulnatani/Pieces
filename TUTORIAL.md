@@ -521,13 +521,10 @@ When `-d` / `--detach` is passed:
 - **Backoff & Liveness:** Starts at `100 ms` delay and doubles up to `5000 ms`, resetting to `100 ms` if an attempt stays alive longer than **5 seconds**. Each restart tears down stale `DNAT`/`veth`/cgroup handles and reuses `net_plan` and rootfs cleanly.
 - **`stop_container`:** Writes `.stop_requested`, sends `SIGTERM` to `pid`, polls every `100 ms` up to `-t/--time` seconds (default `10`), escalates to `SIGKILL` if still alive, cleans up ports/`veth`/`cgroup`, releases IPAM lease, and marks `meta.json` `status = "exited"`.
 
-### 9.3 Interactive Pseudo-Terminal (`-t` / `-it`)
+### 9.3 Interactive Pseudo-Terminal (`-t` / `-it` / `-dit`)
 
-In foreground mode when `-t`/`-it` is used and host stdin is a TTY:
-1. `openpty(&pty_master, &pty_slave, ...)` opens a host-controlled PTY pair before `fork()`.
-2. `TerminalRawGuard` RAII saves host `termios` (`tcgetattr`), enables raw mode (`cfmakeraw`), and guarantees restoration even on exceptions or signals.
-3. Window dimensions (`TIOCGWINSZ` → `TIOCSWINSZ`) synchronize at startup and live via `SIGWINCH`.
-4. `SIGINT` and `SIGTERM` caught on the host relay directly to `grandchild_pid` via `::kill`, while `poll()` multiplexes bidirectional bytes between `STDIN_FILENO`/`STDOUT_FILENO` and `pty_master`.
+- **Foreground `-t` / `-it`:** When host stdin is a TTY, `openpty` allocates a host-controlled PTY pair before `fork()`, `TerminalRawGuard` RAII puts host stdin in raw mode (`cfmakeraw`), window sizes (`TIOCGWINSZ`/`TIOCSWINSZ` + `SIGWINCH`) synchronize live, and `SIGINT`/`SIGTERM` relay to `grandchild_pid` while `poll()` multiplexes bytes.
+- **Detached Keepalive (`-dt`, `-di`, `-dit`):** Passing `-t`/`-it` alongside `-d` allocates a default `80x24` PTY (or an open stdin keepalive pipe for `-di`) held open by the detached supervisor while `drain_fd_to_rotating_log` captures output, matching `docker run -dit <image> /bin/sh` behavior so shells stay running until stopped.
 
 ### 9.4 `exec`, `ps`, `rm`, `rmi`, and `prune`
 

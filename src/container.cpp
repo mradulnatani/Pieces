@@ -381,9 +381,10 @@ int run_single_container_attempt(
 
     int pty_master = -1;
     int pty_slave = -1;
-    bool use_pty = !config.detach && config.allocate_tty && ::isatty(STDIN_FILENO);
+    bool use_pty = config.allocate_tty && (config.detach || ::isatty(STDIN_FILENO));
     if (use_pty) {
-        if (::openpty(&pty_master, &pty_slave, nullptr, nullptr, nullptr) != 0) {
+        struct winsize default_ws{24, 80, 0, 0};
+        if (::openpty(&pty_master, &pty_slave, nullptr, nullptr, &default_ws) != 0) {
             use_pty = false;
             pty_master = -1;
             pty_slave = -1;
@@ -391,10 +392,18 @@ int run_single_container_attempt(
     }
 
     int log_pipe[2]{-1, -1};
+    int stdin_keepalive_pipe[2]{-1, -1};
     int null_fd = -1;
-    if (config.detach) {
+    if (config.detach && !use_pty) {
         if (::pipe(log_pipe) != 0) return 1;
-        null_fd = ::open("/dev/null", O_RDONLY);
+        if (config.interactive) {
+            if (::pipe(stdin_keepalive_pipe) != 0) {
+                ::close(log_pipe[0]); ::close(log_pipe[1]);
+                return 1;
+            }
+        } else {
+            null_fd = ::open("/dev/null", O_RDONLY);
+        }
     }
 
     int ready_pipe[2]{-1, -1};
@@ -404,6 +413,7 @@ int run_single_container_attempt(
         (use_userns && ::pipe(userns_done_pipe) != 0)) {
         if (pty_master >= 0) { ::close(pty_master); ::close(pty_slave); }
         if (log_pipe[0] >= 0) { ::close(log_pipe[0]); ::close(log_pipe[1]); }
+        if (stdin_keepalive_pipe[0] >= 0) { ::close(stdin_keepalive_pipe[0]); ::close(stdin_keepalive_pipe[1]); }
         if (null_fd >= 0) ::close(null_fd);
         if (ready_pipe[0] >= 0) { ::close(ready_pipe[0]); ::close(ready_pipe[1]); }
         if (go_pipe[0] >= 0) { ::close(go_pipe[0]); ::close(go_pipe[1]); }
@@ -418,6 +428,7 @@ int run_single_container_attempt(
     if (pid1 < 0) {
         if (pty_master >= 0) { ::close(pty_master); ::close(pty_slave); }
         if (log_pipe[0] >= 0) { ::close(log_pipe[0]); ::close(log_pipe[1]); }
+        if (stdin_keepalive_pipe[0] >= 0) { ::close(stdin_keepalive_pipe[0]); ::close(stdin_keepalive_pipe[1]); }
         if (null_fd >= 0) ::close(null_fd);
         ::close(ready_pipe[0]); ::close(ready_pipe[1]);
         if (use_userns) { ::close(userns_done_pipe[0]); ::close(userns_done_pipe[1]); }
@@ -431,6 +442,7 @@ int run_single_container_attempt(
         ::close(go_pipe[1]);
         if (pty_master >= 0) ::close(pty_master);
         if (log_pipe[0] >= 0) ::close(log_pipe[0]);
+        if (stdin_keepalive_pipe[1] >= 0) ::close(stdin_keepalive_pipe[1]);
         if (notify_parent_fd >= 0) ::close(notify_parent_fd);
 
         try {
@@ -468,7 +480,10 @@ int run_single_container_attempt(
                         ::dup2(log_pipe[1], STDOUT_FILENO);
                         ::dup2(log_pipe[1], STDERR_FILENO);
                         ::close(log_pipe[1]);
-                        if (null_fd >= 0) {
+                        if (stdin_keepalive_pipe[0] >= 0) {
+                            ::dup2(stdin_keepalive_pipe[0], STDIN_FILENO);
+                            ::close(stdin_keepalive_pipe[0]);
+                        } else if (null_fd >= 0) {
                             ::dup2(null_fd, STDIN_FILENO);
                             ::close(null_fd);
                         }
@@ -544,6 +559,7 @@ int run_single_container_attempt(
                 ::close(go_pipe[0]);
                 if (pty_slave >= 0) ::close(pty_slave);
                 if (log_pipe[1] >= 0) ::close(log_pipe[1]);
+                if (stdin_keepalive_pipe[0] >= 0) ::close(stdin_keepalive_pipe[0]);
                 if (null_fd >= 0) ::close(null_fd);
 
                 std::string p2_msg = std::to_string(pid2) + "\n";
@@ -558,6 +574,7 @@ int run_single_container_attempt(
             std::cerr << "CHILD ERROR: " << exc.what() << "\n";
             if (pty_slave >= 0) ::close(pty_slave);
             if (log_pipe[1] >= 0) ::close(log_pipe[1]);
+            if (stdin_keepalive_pipe[0] >= 0) ::close(stdin_keepalive_pipe[0]);
             if (null_fd >= 0) ::close(null_fd);
             ::close(ready_pipe[1]);
             if (use_userns) ::close(userns_done_pipe[0]);
@@ -571,6 +588,7 @@ int run_single_container_attempt(
     ::close(go_pipe[0]);
     if (pty_slave >= 0) ::close(pty_slave);
     if (log_pipe[1] >= 0) ::close(log_pipe[1]);
+    if (stdin_keepalive_pipe[0] >= 0) ::close(stdin_keepalive_pipe[0]);
     if (null_fd >= 0) ::close(null_fd);
 
     auto read_line_fd = [](int fd) -> std::string {
@@ -634,8 +652,16 @@ int run_single_container_attempt(
         notify_parent_fd = -1;
     }
 
-    if (pty_master >= 0) {
+    if (pty_master >= 0 && !config.detach) {
         relay_pty_session(pty_master, grandchild_pid);
+        ::close(pty_master);
+    } else if (pty_master >= 0 && config.detach) {
+        // Hold PTY master open in detached `-dt`/`-dit` mode so shells do not hit EOF while logging output
+        RotatingLogWriter logger(
+            (fs::path(container_dir) / "container.log").string(),
+            config.log_max_bytes,
+            config.log_max_files);
+        drain_fd_to_rotating_log(pty_master, logger);
         ::close(pty_master);
     } else if (log_pipe[0] >= 0) {
         RotatingLogWriter logger(
@@ -644,6 +670,9 @@ int run_single_container_attempt(
             config.log_max_files);
         drain_fd_to_rotating_log(log_pipe[0], logger);
         ::close(log_pipe[0]);
+        if (stdin_keepalive_pipe[1] >= 0) ::close(stdin_keepalive_pipe[1]);
+    } else if (stdin_keepalive_pipe[1] >= 0) {
+        ::close(stdin_keepalive_pipe[1]);
     }
 
     int status1 = 0;
