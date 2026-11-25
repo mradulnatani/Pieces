@@ -455,6 +455,9 @@ CMD ["/bin/sh"]
     CHECK(cli_run.detach && cli_run.interactive);
     CHECK(cli_run.cmd_args == std::vector<std::string>{"arg1"});
 
+    auto cli_dit = pieces::parse_command_args({"run", "-dit", "--name", "sh1", "ubuntu-22.04", "/bin/sh"});
+    CHECK(cli_dit.detach && cli_dit.interactive && cli_dit.allocate_tty && cli_dit.name == "sh1");
+
     auto cli_tag = pieces::parse_command_args({"tag", "a", "b"});
     CHECK(cli_tag.command == pieces::CliCommand::Tag);
     auto cli_cp = pieces::parse_command_args({"cp", "c1:/a", "/tmp/a"});
